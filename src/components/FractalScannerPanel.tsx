@@ -48,7 +48,7 @@ import {
   type LevelCrossStatus,
   type EngulfingDetectionResult,
 } from '../utils/fractal';
-import { formatSignalDateTime } from '../utils/signals';
+import { formatSignalDateTime, isCorruptedSignal } from '../utils/signals';
 import { FractalAgentFace3D } from './FractalAgentFace3D';
 
 interface FractalScannerPanelProps {
@@ -127,7 +127,10 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
       // Strictly purge low-grade signals (Tier B+ or score < 72)
       const highGradeOnly = Array.isArray(parsed)
         ? parsed.filter(
-            (s) => s.strongnessTier !== 'B+' && (s.strongnessScore ?? 0) >= 72
+            (s) =>
+              s.strongnessTier !== 'B+' &&
+              (s.strongnessScore ?? 0) >= 72 &&
+              !isCorruptedSignal(s)
           )
         : [];
       if (highGradeOnly.length !== parsed.length) {
@@ -173,6 +176,17 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
     if (!candlesLTF.length) return null;
     const latestBar = candlesLTF[candlesLTF.length - 1];
 
+    // Symbol sanity verification: Ensure candles match the selected asset
+    if (fourHourLevels.symbol !== selectedSymbol) return null;
+    const currentTicker = tickers.find((t) => t.symbol === selectedSymbol);
+    if (currentTicker && currentTicker.lastPrice > 0) {
+      const priceRatio = latestBar.close / currentTicker.lastPrice;
+      // If candle price differs from live ticker by > 35%, candles belong to another asset
+      if (priceRatio < 0.65 || priceRatio > 1.45) {
+        return null;
+      }
+    }
+
     // Trigger condition: Level is crossed AND matching engulfing occurs
     if (
       (levelCrossStatus.type === 'HIGH_CROSSED' && engulfingResult.type === 'BEARISH') ||
@@ -188,26 +202,29 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
         return null;
       }
 
-      return generateFractalTradeSignal({
+      const sig = generateFractalTradeSignal({
         symbol: selectedSymbol,
         timeframe: ltfInterval,
         fourHourLevels,
         engulfingResult,
         candle: latestBar,
       });
+
+      if (isCorruptedSignal(sig)) return null;
+      return sig;
     }
     return null;
-  }, [candlesLTF, levelCrossStatus, engulfingResult, selectedSymbol, ltfInterval, fourHourLevels]);
+  }, [candlesLTF, levelCrossStatus, engulfingResult, selectedSymbol, ltfInterval, fourHourLevels, tickers]);
 
   // Auto-record new unique signals to Signal Ledger
   useEffect(() => {
-    if (activeSignalCandidate) {
+    if (activeSignalCandidate && !isCorruptedSignal(activeSignalCandidate)) {
       if (onRecordSignal) {
         onRecordSignal(activeSignalCandidate);
       }
       setLocalSignalLedger((prev) => {
         if (prev.some((s) => s.id === activeSignalCandidate.id)) return prev;
-        const updated = [activeSignalCandidate, ...prev].slice(0, 50);
+        const updated = [activeSignalCandidate, ...prev.filter((s) => !isCorruptedSignal(s))].slice(0, 50);
         try {
           localStorage.setItem('vp_fractal_signal_ledger', JSON.stringify(updated));
         } catch {

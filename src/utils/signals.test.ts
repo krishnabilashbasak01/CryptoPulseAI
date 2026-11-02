@@ -18,6 +18,7 @@ import {
   isHighGradeSignal,
   syncAndMergeAllSignals,
   formatSignalDateTime,
+  isCorruptedSignal,
   type UnifiedSignal,
 } from './signals';
 import type { FractalTradeSignal } from './fractal';
@@ -487,6 +488,40 @@ test('formatSignalDateTime produces both Date and Time across all signal input t
   };
   assert.strictEqual(formatSignalDateTime(sigObj), '1 Nov, 06:59 pm');
 });
+
+test('isCorruptedSignal accurately flags cross-symbol contaminated prices (e.g. BTCUSDT at $0.15970)', () => {
+  // Desynchronized BTCUSDT with DOGE's $0.15970 price
+  const corruptBtcSignal = {
+    id: 'corrupt-btc-doge-mix',
+    symbol: 'BTCUSDT',
+    entryPrice: 0.1597,
+    stopLoss: 0.15774,
+    tp1: 0.16362,
+    pnlPercent: 48872792.92,
+  };
+  assert.strictEqual(isCorruptedSignal(corruptBtcSignal), true, 'Must flag BTC at $0.1597 as corrupted');
+
+  // Valid BTC signal
+  const validBtcSignal = {
+    id: 'valid-btc',
+    symbol: 'BTCUSDT',
+    entryPrice: 78050.0,
+    stopLoss: 77000.0,
+    tp1: 80000.0,
+    pnlPercent: 1.25,
+  };
+  assert.strictEqual(isCorruptedSignal(validBtcSignal), false, 'Must accept real BTC price');
+
+  // Corrupted SOL at $0.1597 or $2150.0
+  assert.strictEqual(isCorruptedSignal({ symbol: 'SOLUSDT', entryPrice: 0.1597 }), true);
+  assert.strictEqual(isCorruptedSignal({ symbol: 'SOLUSDT', entryPrice: 2150.0 }), true);
+  assert.strictEqual(isCorruptedSignal({ symbol: 'SOLUSDT', entryPrice: 95.39 }), false);
+
+  // Corrupted DOGE at $78050.0
+  assert.strictEqual(isCorruptedSignal({ symbol: 'DOGEUSDT', entryPrice: 78050.0 }), true);
+  assert.strictEqual(isCorruptedSignal({ symbol: 'DOGEUSDT', entryPrice: 0.159 }), false);
+});
+
 
 
 

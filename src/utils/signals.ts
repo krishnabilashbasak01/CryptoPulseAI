@@ -182,6 +182,32 @@ export function calculatePositionSizeAndRisk(inputs: PositionCalculatorInputs): 
 }
 
 /**
+ * Validates whether a signal has an impossible/corrupted price for its symbol.
+ * Prevents cross-symbol pollution caused by asynchronous symbol switching
+ * (e.g., BTC/USDT mistakenly receiving DOGE/USDT's $0.15970 candle price).
+ */
+export function isCorruptedSignal(sig: any): boolean {
+  if (!sig || !sig.symbol || typeof sig.entryPrice !== 'number' || isNaN(sig.entryPrice) || sig.entryPrice <= 0) {
+    return true;
+  }
+  const sym = String(sig.symbol).toUpperCase();
+  // Realistic price boundaries per asset to prevent cross-symbol pollution
+  if (sym.startsWith('BTC') && (sig.entryPrice < 15000 || sig.entryPrice > 300000)) return true;
+  if (sym.startsWith('ETH') && (sig.entryPrice < 500 || sig.entryPrice > 25000)) return true;
+  if (sym.startsWith('SOL') && (sig.entryPrice < 15 || sig.entryPrice > 600)) return true;
+  if (sym.startsWith('NEAR') && (sig.entryPrice < 0.2 || sig.entryPrice > 50)) return true;
+  if (sym.startsWith('DOGE') && (sig.entryPrice < 0.01 || sig.entryPrice > 5)) return true;
+  if (sym.startsWith('LSK') && (sig.entryPrice < 0.05 || sig.entryPrice > 20)) return true;
+  if (sym.startsWith('SUI') && (sig.entryPrice < 0.1 || sig.entryPrice > 50)) return true;
+  if (sym.startsWith('XRP') && (sig.entryPrice < 0.1 || sig.entryPrice > 25)) return true;
+
+  // Absurd PnL percentage (> 2,000%) or corrupted target calculations
+  if (typeof sig.pnlPercent === 'number' && Math.abs(sig.pnlPercent) > 2000) return true;
+
+  return false;
+}
+
+/**
  * Reconciles and repairs any signals that may have been saved in localStorage
  * with invalid or conflicting state (such as false stop outs caused by past 24h high checks).
  */
@@ -285,7 +311,13 @@ export function evaluateSignalsAgainstMarketPrices(
   }
 
   let hasChanges = false;
-  const updatedSignals: UnifiedSignal[] = signals.map((rawSig): UnifiedSignal => {
+  // Automatically filter out any corrupted signals
+  const validSignals = signals.filter((s) => !isCorruptedSignal(s));
+  if (validSignals.length !== signals.length) {
+    hasChanges = true;
+  }
+
+  const updatedSignals: UnifiedSignal[] = validSignals.map((rawSig): UnifiedSignal => {
     const sig = healUnifiedSignal(rawSig);
     if (sig !== rawSig) {
       hasChanges = true;
@@ -300,6 +332,17 @@ export function evaluateSignalsAgainstMarketPrices(
       typeof ticker.highPrice === 'number' && !isNaN(ticker.highPrice) ? ticker.highPrice : currentPrice;
     const lowPrice =
       typeof ticker.lowPrice === 'number' && !isNaN(ticker.lowPrice) ? ticker.lowPrice : currentPrice;
+
+    // Cross-symbol safety check: if entry price differs by > 5x from live quote, mark as invalid
+    const ratio = sig.entryPrice / currentPrice;
+    if (ratio < 0.2 || ratio > 5.0) {
+      hasChanges = true;
+      return {
+        ...sig,
+        status: 'EXPIRED',
+        failureReason: 'Symbol desynchronization detected (invalid historical entry price)',
+      };
+    }
 
     // Calculate live PnL percent relative to entry
     const isLong = sig.direction === 'LONG';
@@ -1044,7 +1087,10 @@ export function syncAndMergeAllSignals(tickers?: MarketPriceQuote[]): UnifiedSig
       const parsed = JSON.parse(rawFractal);
       if (Array.isArray(parsed)) {
         fractalList = parsed.filter(
-          (s) => s.strongnessTier !== 'B+' && (s.strongnessScore ?? 0) >= 72
+          (s) =>
+            s.strongnessTier !== 'B+' &&
+            (s.strongnessScore ?? 0) >= 72 &&
+            !isCorruptedSignal(s)
         );
         if (typeof localStorage !== 'undefined' && fractalList.length !== parsed.length) {
           localStorage.setItem('vp_fractal_signal_ledger', JSON.stringify(fractalList));
@@ -1064,7 +1110,7 @@ export function syncAndMergeAllSignals(tickers?: MarketPriceQuote[]): UnifiedSig
     if (rawUnified) {
       const parsed = JSON.parse(rawUnified);
       if (Array.isArray(parsed)) {
-        unifiedList = parsed.filter(isHighGradeSignal);
+        unifiedList = parsed.filter((s) => isHighGradeSignal(s) && !isCorruptedSignal(s));
         if (typeof localStorage !== 'undefined' && unifiedList.length !== parsed.length) {
           localStorage.setItem('vp_unified_signals_ledger', JSON.stringify(unifiedList));
         }
@@ -1089,8 +1135,8 @@ export function syncAndMergeAllSignals(tickers?: MarketPriceQuote[]): UnifiedSig
 
   for (const rawSig of combined) {
     const sig = healUnifiedSignal(rawSig);
-    // User requested "don't generate low graded signal": filter out any low-grade signals
-    if (!isHighGradeSignal(sig)) {
+    // User requested "don't generate low graded signal": filter out any low-grade or corrupted signals
+    if (!isHighGradeSignal(sig) || isCorruptedSignal(sig)) {
       continue;
     }
 

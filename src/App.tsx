@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Search,
   Sparkles,
@@ -51,6 +51,7 @@ import {
   purgeInactiveSignalsFromStorage,
   clearAllSignalsStorage,
   evaluateSignalsAgainstMarketPrices,
+  isCorruptedSignal,
   type UnifiedSignal,
 } from './utils/signals';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -200,6 +201,10 @@ export default function App() {
   const [candles4H, setCandles4H] = useState<Candle[]>([]);
   const [candlesLTF, setCandlesLTF] = useState<Candle[]>([]);
   const [ltfInterval, setLtfInterval] = useState<'5m' | '1m'>('5m');
+  const selectedSymbolRef = useRef(selectedSymbol);
+  useEffect(() => {
+    selectedSymbolRef.current = selectedSymbol;
+  }, [selectedSymbol]);
 
   // Alerts state
   const [alerts, setAlerts] = useState<PriceAlert[]>(INITIAL_ALERTS);
@@ -365,13 +370,14 @@ export default function App() {
         fetch(`/api/market/klines?symbol=${encodeURIComponent(sym)}&interval=4h&limit=120`),
         fetch(`/api/market/klines?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(ltf)}&limit=120`),
       ]);
+      if (selectedSymbolRef.current !== sym) return;
       if (res4H.ok) {
         const d4 = await res4H.json();
-        if (Array.isArray(d4.candles)) setCandles4H(d4.candles);
+        if (Array.isArray(d4.candles) && selectedSymbolRef.current === sym) setCandles4H(d4.candles);
       }
       if (resLTF.ok) {
         const dL = await resLTF.json();
-        if (Array.isArray(dL.candles)) setCandlesLTF(dL.candles);
+        if (Array.isArray(dL.candles) && selectedSymbolRef.current === sym) setCandlesLTF(dL.candles);
       }
     } catch {
       // ignore
@@ -871,8 +877,10 @@ export default function App() {
                   onSelectSymbol={(sym) => setSelectedSymbol(sym)}
                   onAddAlert={handleAddAlert}
                   onRecordSignal={(fractalSig: FractalTradeSignal) => {
+                    if (isCorruptedSignal(fractalSig)) return;
                     const unified = convertFractalSignalToUnified(fractalSig);
-                    setUnifiedSignals((prev) => [unified, ...prev.filter((s) => s.id !== unified.id)].slice(0, 50));
+                    if (isCorruptedSignal(unified)) return;
+                    setUnifiedSignals((prev) => [unified, ...prev.filter((s) => s.id !== unified.id && !isCorruptedSignal(s))].slice(0, 50));
                   }}
                   onNavigateToSignalsHub={() => setTerminalTab('SIGNALS')}
                   sharedSignalLedger={fractalSignalsForPanel}
