@@ -120,13 +120,15 @@ export default function App() {
 
   // Unified Signals Ledger Hub State (Rule 6 + User Request: Separate all signals with strategy & AI decision)
   const [unifiedSignals, setUnifiedSignals] = useState<UnifiedSignal[]>(() => {
-    return syncAndMergeAllSignals();
+    const initial = syncAndMergeAllSignals();
+    return initial.filter((s) => !isCorruptedSignal(s));
   });
 
   // Re-sync on storage change or mount
   useEffect(() => {
     const handleStorage = () => {
-      setUnifiedSignals(syncAndMergeAllSignals(tickers));
+      const synced = syncAndMergeAllSignals(tickers);
+      setUnifiedSignals(synced.filter((s) => !isCorruptedSignal(s)));
     };
     window.addEventListener('storage', handleStorage);
     return () => window.removeEventListener('storage', handleStorage);
@@ -136,23 +138,26 @@ export default function App() {
   useEffect(() => {
     if (tickers.length === 0) return;
     setUnifiedSignals((prev) => {
-      const { updatedSignals, hasChanges } = evaluateSignalsAgainstMarketPrices(prev, tickers);
-      if (hasChanges) {
+      const cleanPrev = prev.filter((s) => !isCorruptedSignal(s));
+      const { updatedSignals, hasChanges } = evaluateSignalsAgainstMarketPrices(cleanPrev, tickers);
+      const cleanUpdated = updatedSignals.filter((s) => !isCorruptedSignal(s));
+      if (hasChanges || cleanPrev.length !== prev.length) {
         try {
-          localStorage.setItem('vp_unified_signals_ledger', JSON.stringify(updatedSignals));
+          localStorage.setItem('vp_unified_signals_ledger', JSON.stringify(cleanUpdated));
         } catch {
           // ignore storage error
         }
-        return updatedSignals;
+        return cleanUpdated;
       }
-      return prev;
+      return cleanPrev;
     });
   }, [tickers]);
 
   // Persistent storage for Unified Signals Ledger
   useEffect(() => {
     try {
-      localStorage.setItem('vp_unified_signals_ledger', JSON.stringify(unifiedSignals));
+      const clean = unifiedSignals.filter((s) => !isCorruptedSignal(s));
+      localStorage.setItem('vp_unified_signals_ledger', JSON.stringify(clean));
     } catch {
       // ignore storage error
     }

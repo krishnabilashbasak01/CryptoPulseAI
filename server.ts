@@ -836,56 +836,76 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
 
       if (dateRangePreset === '24h') {
         startTimeMs = now - 24 * 3600 * 1000;
+        endTimeMs = now;
       } else if (dateRangePreset === '3d') {
         startTimeMs = now - 3 * 24 * 3600 * 1000;
+        endTimeMs = now;
       } else if (dateRangePreset === '7d') {
         startTimeMs = now - 7 * 24 * 3600 * 1000;
+        endTimeMs = now;
       } else if (dateRangePreset === '14d') {
         startTimeMs = now - 14 * 24 * 3600 * 1000;
+        endTimeMs = now;
       } else if (dateRangePreset === '30d') {
         startTimeMs = now - 30 * 24 * 3600 * 1000;
+        endTimeMs = now;
       } else if (dateRangePreset === 'custom' && customStart && customEnd) {
-        startTimeMs = new Date(customStart).getTime();
-        endTimeMs = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
+        const rawStart = new Date(customStart).getTime();
+        const rawEnd = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
+        startTimeMs = Math.min(rawStart, rawEnd);
+        endTimeMs = Math.max(rawStart, rawEnd);
       }
 
-      let candles4H: Candle[];
-      let candlesLTF: Candle[] = [];
+      // Dynamic required bars calculation based on exact time span
+      const spanMs = Math.max(0, endTimeMs - startTimeMs);
+      const barMs = timeframe === '1m' ? 60 * 1000 : 5 * 60 * 1000;
+      const neededBars = Math.ceil(spanMs / barMs) + 60; // 60 warmup bars
 
+      // Safe ceiling: 12,000 bars covers up to 41.6 days of 5m execution in ~3-4 seconds
+      const MAX_LTF_BARS = 12000;
+      const targetBars = Math.min(neededBars, MAX_LTF_BARS);
+
+      // 1. Fetch 4H candles with adequate lead-in warmup (15 days prior) for Williams Fractals
+      const h4StartMs = Math.max(0, startTimeMs - 15 * 24 * 3600 * 1000);
+      let candles4H: Candle[] = [];
       try {
-        const raw4H = await fetchFromBinance(
-          `/klines?symbol=${encodeURIComponent(symbol)}&interval=4h&limit=500&endTime=${endTimeMs}`
-        );
-        candles4H = raw4H.map((k: any) => ({
-          time: Number(k[0]),
-          open: parseFloat(k[1]),
-          high: parseFloat(k[2]),
-          low: parseFloat(k[3]),
-          close: parseFloat(k[4]),
-          volume: parseFloat(k[5]),
-          quoteVolume: parseFloat(k[7]),
-        }));
+        let cur4H = h4StartMs;
+        while (cur4H < endTimeMs && candles4H.length < 2500) {
+          const batchLimit = Math.min(1000, 2500 - candles4H.length);
+          const raw4H = await fetchFromBinance(
+            `/klines?symbol=${encodeURIComponent(symbol)}&interval=4h&limit=${batchLimit}&startTime=${cur4H}`
+          );
+          if (!Array.isArray(raw4H) || raw4H.length === 0) break;
+          const mapped = raw4H.map((k: any) => ({
+            time: Number(k[0]),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+            quoteVolume: parseFloat(k[7]),
+          }));
+          candles4H = candles4H.concat(mapped);
+          const lastTime = mapped[mapped.length - 1].time;
+          if (lastTime >= endTimeMs || raw4H.length < batchLimit) break;
+          cur4H = lastTime + 1;
+        }
+        if (candles4H.length === 0) {
+          candles4H = buildFallbackKlines(symbol, '4h', 500);
+        }
       } catch {
         candles4H = buildFallbackKlines(symbol, '4h', 500);
       }
 
-      const targetBars =
-        dateRangePreset === '24h'
-          ? 350
-          : dateRangePreset === '3d'
-          ? 1000
-          : dateRangePreset === '7d'
-          ? 2200
-          : dateRangePreset === '14d'
-          ? 3200
-          : 3600;
-
+      // 2. Fetch execution timeframe (5m or 1m) candles starting from startTimeMs forward
+      let candlesLTF: Candle[] = [];
       try {
-        let currentEnd = endTimeMs;
-        while (candlesLTF.length < targetBars) {
+        const ltfStartMs = Math.max(0, startTimeMs - 20 * barMs);
+        let curLTF = ltfStartMs;
+        while (candlesLTF.length < targetBars && curLTF <= endTimeMs) {
           const batchLimit = Math.min(1000, targetBars - candlesLTF.length);
           const rawBatch = await fetchFromBinance(
-            `/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${batchLimit}&endTime=${currentEnd}`
+            `/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${batchLimit}&startTime=${curLTF}`
           );
           if (!Array.isArray(rawBatch) || rawBatch.length === 0) break;
           const mappedBatch = rawBatch.map((k: any) => ({
@@ -897,10 +917,10 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
             volume: parseFloat(k[5]),
             quoteVolume: parseFloat(k[7]),
           }));
-          candlesLTF = mappedBatch.concat(candlesLTF);
-          currentEnd = rawBatch[0][0] - 1;
-          if (startTimeMs && currentEnd < startTimeMs) break;
-          if (rawBatch.length < batchLimit) break;
+          candlesLTF = candlesLTF.concat(mappedBatch);
+          const lastTime = mappedBatch[mappedBatch.length - 1].time;
+          if (lastTime >= endTimeMs || rawBatch.length < batchLimit) break;
+          curLTF = lastTime + 1;
         }
 
         if (candlesLTF.length === 0) {

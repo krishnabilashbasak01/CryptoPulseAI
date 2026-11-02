@@ -38,6 +38,7 @@ import {
   parseSignalTimestamp,
   formatSignalDateTime,
   calculatePositionSizeAndRisk,
+  isCorruptedSignal,
   type UnifiedSignal,
   type SignalStrategyId,
 } from '../utils/signals';
@@ -115,17 +116,22 @@ export const UnifiedSignalsPanel: React.FC<UnifiedSignalsPanelProps> = ({
     });
   }, [inspectedSignal, calcCustomEntry, calcCustomSL, calcLossAmount, calcLeverage]);
 
+  // Sanitize signals to guarantee that any contaminated/corrupted legacy signals are purged
+  const validSignals = useMemo(() => {
+    return signals.filter((s) => !isCorruptedSignal(s));
+  }, [signals]);
+
   // Statistics & KPI calculations
   const stats = useMemo(() => {
-    const total = signals.length;
-    const aiDecided = signals.filter((s) => s.aiUsed);
-    const algoDecided = signals.filter((s) => !s.aiUsed);
-    const activeList = signals.filter((s) => s.status === 'ACTIVE');
-    const winners = signals.filter((s) => s.status === 'HIT_TP1' || s.status === 'HIT_TP2' || s.status === 'HIT_TP3');
-    const stoppedList = signals.filter((s) => s.status === 'STOPPED_OUT');
-    const expiredList = signals.filter((s) => s.status === 'EXPIRED');
-    const highConvictionList = signals.filter((s) => s.strongnessTier === 'A+');
-    const closed = signals.filter((s) => s.status !== 'ACTIVE' && s.status !== 'PENDING');
+    const total = validSignals.length;
+    const aiDecided = validSignals.filter((s) => s.aiUsed);
+    const algoDecided = validSignals.filter((s) => !s.aiUsed);
+    const activeList = validSignals.filter((s) => s.status === 'ACTIVE');
+    const winners = validSignals.filter((s) => s.status === 'HIT_TP1' || s.status === 'HIT_TP2' || s.status === 'HIT_TP3');
+    const stoppedList = validSignals.filter((s) => s.status === 'STOPPED_OUT');
+    const expiredList = validSignals.filter((s) => s.status === 'EXPIRED');
+    const highConvictionList = validSignals.filter((s) => s.strongnessTier === 'A+');
+    const closed = validSignals.filter((s) => s.status !== 'ACTIVE' && s.status !== 'PENDING');
     const winRate = closed.length > 0 ? (winners.length / closed.length) * 100 : 0;
     const totalCreditsSpent = aiDecided.reduce((acc, s) => acc + (s.aiCreditsConsumed || 0), 0);
 
@@ -142,12 +148,12 @@ export const UnifiedSignalsPanel: React.FC<UnifiedSignalsPanelProps> = ({
       winRate: winRate.toFixed(1),
       totalCreditsSpent: totalCreditsSpent.toFixed(2),
     };
-  }, [signals]);
+  }, [validSignals]);
 
   // Filtered & Chronologically Sorted signals list
   const filteredSignals = useMemo(() => {
     const query = searchQuery.trim().toUpperCase();
-    const result = signals.filter((sig) => {
+    const result = validSignals.filter((sig) => {
       // 1. Text Search
       if (query && !sig.symbol.includes(query) && !sig.strategyName.toUpperCase().includes(query)) {
         return false;

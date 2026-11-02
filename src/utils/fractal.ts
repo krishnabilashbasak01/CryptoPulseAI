@@ -167,6 +167,11 @@ export interface BacktestSummary {
   tp3HitRate: number;
   trades: BacktestTrade[];
   failureCategorization: Record<string, number>;
+  requestedStartDate?: string;
+  requestedEndDate?: string;
+  isRangeTruncated?: boolean;
+  candlesLTFCount?: number;
+  candles4HCount?: number;
   createdAt: string;
 }
 
@@ -1247,12 +1252,31 @@ export function runFractalBacktest(params: {
   const firstCandle = candlesLTF[0];
   const lastCandle = candlesLTF[candlesLTF.length - 1];
 
+  // Actual simulated time boundary: bounded by the available candle datasets
+  const actualStartMs = firstCandle
+    ? Math.max(firstCandle.time, startTimeMs || firstCandle.time)
+    : (startTimeMs || 0);
+  const actualEndMs = lastCandle
+    ? Math.min(lastCandle.time, endTimeMs || lastCandle.time)
+    : (endTimeMs || 0);
+
+  const isRangeTruncated = Boolean(
+    startTimeMs &&
+    endTimeMs &&
+    (actualEndMs - actualStartMs < (endTimeMs - startTimeMs) * 0.8)
+  );
+
   return {
     symbol,
     timeframe,
     dateRangePreset,
-    startDate: startTimeMs ? formatTimeStr(startTimeMs) : firstCandle ? formatTimeStr(firstCandle.time) : '',
-    endDate: endTimeMs ? formatTimeStr(endTimeMs) : lastCandle ? formatTimeStr(lastCandle.time) : '',
+    startDate: actualStartMs ? formatTimeStr(actualStartMs) : (firstCandle ? formatTimeStr(firstCandle.time) : ''),
+    endDate: actualEndMs ? formatTimeStr(actualEndMs) : (lastCandle ? formatTimeStr(lastCandle.time) : ''),
+    requestedStartDate: startTimeMs ? formatTimeStr(startTimeMs) : undefined,
+    requestedEndDate: endTimeMs ? formatTimeStr(endTimeMs) : undefined,
+    isRangeTruncated,
+    candlesLTFCount: candlesLTF.length,
+    candles4HCount: candles4H.length,
     startTimeMs,
     endTimeMs,
     riskPerTradeUsdt,

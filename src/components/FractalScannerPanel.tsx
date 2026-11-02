@@ -369,6 +369,11 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
       dateRangePreset: raw?.dateRangePreset || dateRangePreset,
       startDate: raw?.startDate || (trades[0]?.entryTimeString ?? 'Recent'),
       endDate: raw?.endDate || (trades[trades.length - 1]?.exitTimeString ?? 'Current'),
+      requestedStartDate: raw?.requestedStartDate,
+      requestedEndDate: raw?.requestedEndDate,
+      isRangeTruncated: raw?.isRangeTruncated,
+      candlesLTFCount: raw?.candlesLTFCount,
+      candles4HCount: raw?.candles4HCount,
       createdAt: raw?.createdAt || new Date().toISOString(),
     };
   };
@@ -401,7 +406,7 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
       // 1. Attempt API server backtest with timeout protection
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 12000);
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
 
         const res = await fetch('/api/strategy/backtest', {
           method: 'POST',
@@ -425,13 +430,25 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
           if (data.backtest) {
             rawReport = data.backtest;
           }
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          console.warn('Server backtest returned non-200:', errData);
         }
-      } catch {
-        // Fallback to local calculation below
+      } catch (err: any) {
+        console.warn('API backtest request interrupted or timed out:', err?.message);
       }
 
-      // 2. Fallback to local execution if server fetch failed or timed out
+      // 2. Fallback to local execution only if sufficient candles are loaded or for brief intraday spans
       if (!rawReport) {
+        if (candlesLTF.length < 200 && (dateRangePreset !== '24h' && dateRangePreset !== '3d')) {
+          setBacktestError(
+            `Unable to complete historical backtest for ${dateRangePreset.toUpperCase()}. Market feed timed out. Please try again or test a shorter range.`
+          );
+          if (progressTimer) clearInterval(progressTimer);
+          setIsBacktesting(false);
+          return;
+        }
+
         setBacktestStage('Executing local algorithmic backtest simulation...');
         const now = Date.now();
         let startTimeMs = now - 7 * 24 * 3600 * 1000;
@@ -442,8 +459,10 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
         else if (dateRangePreset === '14d') startTimeMs = now - 14 * 24 * 3600 * 1000;
         else if (dateRangePreset === '30d') startTimeMs = now - 30 * 24 * 3600 * 1000;
         else if (dateRangePreset === 'custom' && customStart && customEnd) {
-          startTimeMs = new Date(customStart).getTime();
-          endTimeMs = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
+          const rawStart = new Date(customStart).getTime();
+          const rawEnd = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
+          startTimeMs = Math.min(rawStart, rawEnd);
+          endTimeMs = Math.max(rawStart, rawEnd);
         }
 
         rawReport = runFractalBacktest({
@@ -1393,6 +1412,11 @@ export const FractalScannerPanel: React.FC<FractalScannerPanelProps> = ({
                   <span className="text-slate-500">
                     ({backtestResult.totalTrades ?? 0} Executions · {backtestResult.timeframe || ltfInterval})
                   </span>
+                  {backtestResult.isRangeTruncated && (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] font-sans">
+                      Buffer limit ({backtestResult.candlesLTFCount?.toLocaleString()} bars)
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-4">
                   <span>
