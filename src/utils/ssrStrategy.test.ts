@@ -14,6 +14,9 @@ import {
   scanSsrAssetStatus,
   runSsrBacktest,
   calculateSsrPositionSize,
+  evaluateSsrForwardSignal,
+  sanitizeSsrLedger,
+  type SsrSignal,
 } from './ssrStrategy';
 import { Candle } from './quant';
 
@@ -212,4 +215,209 @@ test('scanSsrAssetStatus classifies phase correctly across market regimes', () =
   assert.strictEqual(statusSweep.symbol, 'ETHUSDT');
   assert.ok(statusSweep.phase === 'PHASE_1_SWEEP' || statusSweep.phase === 'PHASE_2_MSS');
   assert.strictEqual(statusSweep.liquidityPoolType, 'BSL');
+});
+
+test('sanitizeSsrLedger purges cross-symbol contaminated prices and deduplicates setups', () => {
+  const mockSignals: SsrSignal[] = [
+    // Corrupted entry: BTCUSDT with entry $123.37 (contaminated from AAVE)
+    {
+      id: 'ssr-BTCUSDT-LONG-1',
+      symbol: 'BTCUSDT',
+      time: 1730000000000,
+      timeString: '2026-11-11 15:15',
+      direction: 'LONG',
+      phase: 'PHASE_3_FVG_RETURN',
+      phaseDescription: 'Phase 3 Active',
+      liquidityPoolType: 'SSL',
+      sweptLevel: 122,
+      sweepExtreme: 121,
+      mssLevel: 124,
+      mssTime: 1730000000000,
+      displacementScore: 1.5,
+      fvgProximal: 123.37,
+      fvgDistal: 122.5,
+      fvgSizePercent: 0.5,
+      entryPrice: 123.37, // Impossible for BTC!
+      stopLoss: 122.766,
+      riskAmount: 0.604,
+      riskPercent: 0.5,
+      tp1: 124.578,
+      tp2: 125.5,
+      tp3: 126.5,
+      riskRewardRatio: 2.0,
+      confidenceScore: 92,
+      confidenceTier: 'A+',
+      keyFactors: [],
+      status: 'ACTIVE',
+    },
+    // Duplicate 1: RENDERUSDT at 15:20
+    {
+      id: 'ssr-RENDERUSDT-LONG-1520',
+      symbol: 'RENDERUSDT',
+      time: 1730000300000,
+      timeString: '2026-11-11 15:20',
+      direction: 'LONG',
+      phase: 'PHASE_3_FVG_RETURN',
+      phaseDescription: 'Phase 3 Active',
+      liquidityPoolType: 'SSL',
+      sweptLevel: 1.55,
+      sweepExtreme: 1.54,
+      mssLevel: 1.57,
+      mssTime: 1730000300000,
+      displacementScore: 1.4,
+      fvgProximal: 1.579,
+      fvgDistal: 1.57,
+      fvgSizePercent: 0.4,
+      entryPrice: 1.579,
+      stopLoss: 1.559,
+      riskAmount: 0.02,
+      riskPercent: 1.2,
+      tp1: 1.606,
+      tp2: 1.625,
+      tp3: 1.65,
+      riskRewardRatio: 2.0,
+      confidenceScore: 90,
+      confidenceTier: 'A+',
+      keyFactors: [],
+      status: 'ACTIVE',
+    },
+    // Duplicate 2: RENDERUSDT at 15:25 (identical price level)
+    {
+      id: 'ssr-RENDERUSDT-LONG-1525',
+      symbol: 'RENDERUSDT',
+      time: 1730000600000,
+      timeString: '2026-11-11 15:25',
+      direction: 'LONG',
+      phase: 'PHASE_3_FVG_RETURN',
+      phaseDescription: 'Phase 3 Active',
+      liquidityPoolType: 'SSL',
+      sweptLevel: 1.55,
+      sweepExtreme: 1.54,
+      mssLevel: 1.57,
+      mssTime: 1730000300000,
+      displacementScore: 1.4,
+      fvgProximal: 1.579,
+      fvgDistal: 1.57,
+      fvgSizePercent: 0.4,
+      entryPrice: 1.579,
+      stopLoss: 1.563,
+      riskAmount: 0.016,
+      riskPercent: 1.0,
+      tp1: 1.60,
+      tp2: 1.625,
+      tp3: 1.65,
+      riskRewardRatio: 2.0,
+      confidenceScore: 90,
+      confidenceTier: 'A+',
+      keyFactors: [],
+      status: 'ACTIVE',
+    },
+    // Valid AAVE setup
+    {
+      id: 'ssr-AAVEUSDT-LONG-1',
+      symbol: 'AAVEUSDT',
+      time: 1730000000000,
+      timeString: '2026-11-11 15:15',
+      direction: 'LONG',
+      phase: 'PHASE_3_FVG_RETURN',
+      phaseDescription: 'Phase 3 Active',
+      liquidityPoolType: 'SSL',
+      sweptLevel: 122,
+      sweepExtreme: 121,
+      mssLevel: 124,
+      mssTime: 1730000000000,
+      displacementScore: 1.5,
+      fvgProximal: 123.37,
+      fvgDistal: 122.5,
+      fvgSizePercent: 0.5,
+      entryPrice: 123.37,
+      stopLoss: 122.766,
+      riskAmount: 0.604,
+      riskPercent: 0.5,
+      tp1: 124.578,
+      tp2: 125.5,
+      tp3: 126.5,
+      riskRewardRatio: 2.0,
+      confidenceScore: 92,
+      confidenceTier: 'A+',
+      keyFactors: [],
+      status: 'ACTIVE',
+    },
+  ];
+
+  const liveTickers = [
+    { symbol: 'BTCUSDT', lastPrice: 73697.93 },
+    { symbol: 'RENDERUSDT', lastPrice: 1.606 },
+    { symbol: 'AAVEUSDT', lastPrice: 123.8 },
+  ];
+
+  const { sanitized, purgedCount } = sanitizeSsrLedger(mockSignals, liveTickers);
+
+  // BTCUSDT at $123.37 purged, and RENDERUSDT duplicate collapsed!
+  assert.strictEqual(purgedCount, 2);
+  assert.strictEqual(sanitized.length, 2);
+  assert.strictEqual(sanitized.some((s) => s.symbol === 'BTCUSDT'), false);
+  assert.strictEqual(sanitized.filter((s) => s.symbol === 'RENDERUSDT').length, 1);
+  assert.strictEqual(sanitized.filter((s) => s.symbol === 'AAVEUSDT').length, 1);
+});
+
+test('evaluateSsrForwardSignal executes tiered trailing stop exits without premature freezing', () => {
+  const signal: SsrSignal = {
+    id: 'ssr-SOLUSDT-LONG-1',
+    symbol: 'SOLUSDT',
+    time: 1730000000000,
+    timeString: '2026-11-11 15:00',
+    direction: 'LONG',
+    phase: 'PHASE_3_FVG_RETURN',
+    phaseDescription: 'Phase 3 Active',
+    liquidityPoolType: 'SSL',
+    sweptLevel: 80,
+    sweepExtreme: 79.5,
+    mssLevel: 82,
+    mssTime: 1730000000000,
+    displacementScore: 1.5,
+    fvgProximal: 81,
+    fvgDistal: 80.5,
+    fvgSizePercent: 0.6,
+    entryPrice: 81.0,
+    stopLoss: 80.0, // Risk unit = $1.00
+    riskAmount: 1.0,
+    riskPercent: 1.23,
+    tp1: 82.3, // 1:1.3 R
+    tp2: 83.2, // 1:2.2 R
+    tp3: 84.5, // 1:3.5 R
+    riskRewardRatio: 2.0,
+    confidenceScore: 94,
+    confidenceTier: 'A+',
+    keyFactors: [],
+    status: 'ACTIVE',
+  };
+
+  // 1. Initial price slightly up (live floating R)
+  const tick1 = evaluateSsrForwardSignal(signal, 81.5);
+  assert.strictEqual(tick1.status, 'ACTIVE');
+  assert.strictEqual(tick1.liveR, 0.5);
+  assert.strictEqual(tick1.trailingStopPrice, 80.0);
+
+  // 2. Price hits TP1 (82.3) -> locks Breakeven (81.0) and transitions to HIT_TP1
+  const tick2 = evaluateSsrForwardSignal(tick1, 82.35);
+  assert.strictEqual(tick2.status, 'HIT_TP1');
+  assert.strictEqual(tick2.trailingStopPrice, 81.0); // Stop moved to BE!
+
+  // 3. Price pushes to TP2 (83.2) -> trails stop to TP1 (82.3)
+  const tick3 = evaluateSsrForwardSignal(tick2, 83.25);
+  assert.strictEqual(tick3.status, 'HIT_TP2');
+  assert.strictEqual(tick3.trailingStopPrice, 82.3); // Trailed to TP1!
+
+  // 4. Price pushes all the way to TP3 (84.5) -> complete victory exit (+2.08 R)
+  const tick4 = evaluateSsrForwardSignal(tick3, 84.6);
+  assert.strictEqual(tick4.status, 'HIT_TP3');
+  assert.strictEqual(tick4.realizedR, 2.08);
+  assert.strictEqual(tick4.exitReason, 'TP3 Runner Target Hit');
+
+  // 5. Test Breakeven stop exit if price reverses after TP1
+  const reversedTick = evaluateSsrForwardSignal(tick2, 80.95); // Below 81.0 BE
+  assert.strictEqual(reversedTick.status, 'HIT_TP1');
+  assert.strictEqual(reversedTick.realizedR, 0.65); // Net +0.65R realized profit from 50% booked at TP1!
+  assert.ok(reversedTick.exitReason?.includes('Breakeven SL Hit'));
 });

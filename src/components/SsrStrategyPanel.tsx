@@ -58,6 +58,8 @@ import {
   formatSsrPrice,
   formatSsrTime,
   formatSsrDisplayDateTime,
+  evaluateSsrForwardSignal,
+  sanitizeSsrLedger,
   type SsrSignal,
   type SsrAssetScanResult,
   type SsrPhase,
@@ -160,24 +162,41 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
   const [calcSL, setCalcSL] = useState<number>(0);
 
   // Active Symbol Price
-  const currentTicker = tickers.find((t) => t.symbol === selectedSymbol);
+  const currentTicker = tickers.find((t) => t.symbol.toUpperCase() === selectedSymbol.toUpperCase());
   const currentPrice = currentTicker?.lastPrice || (candlesLTF.length > 0 ? candlesLTF[candlesLTF.length - 1].close : 100);
+
+  // Candle-to-Symbol Alignment Guard:
+  // Prevents cross-symbol data contamination when switching symbols (e.g. BTCUSDT selected while candlesLTF is still AAVEUSDT)
+  const isCandleDataAligned = useMemo(() => {
+    if (!currentTicker || currentTicker.lastPrice <= 0 || candlesLTF.length === 0) return false;
+    const lastClose = candlesLTF[candlesLTF.length - 1].close;
+    const divergence = Math.abs(lastClose - currentTicker.lastPrice) / currentTicker.lastPrice;
+    return divergence < 0.20; // Within 20% tolerance of live ticker price
+  }, [currentTicker, candlesLTF]);
 
   // Live SSR Candidate for current selected symbol
   const activeSignal: SsrSignal | null = useMemo(() => {
+    if (!isCandleDataAligned) return null;
     if (candlesHTF.length < 15 || candlesLTF.length < 25) return null;
     return findLiveSsrSignal(candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt);
-  }, [candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt]);
+  }, [isCandleDataAligned, candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt]);
 
   // Selected Asset Comprehensive SMC Status
   const selectedAssetStatus: SsrAssetScanResult | null = useMemo(() => {
     const fromScan = allAssetStatuses.find((s) => s.symbol.toUpperCase() === selectedSymbol.toUpperCase());
     if (fromScan) return fromScan;
-    if (candlesHTF.length >= 10 && candlesLTF.length >= 10) {
+    if (isCandleDataAligned && candlesHTF.length >= 10 && candlesLTF.length >= 10) {
       return scanSsrAssetStatus(candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt);
     }
-    return null;
-  }, [allAssetStatuses, selectedSymbol, candlesHTF, candlesLTF, riskAmountUsdt]);
+    return {
+      symbol: selectedSymbol,
+      phase: 'INSIDE_RANGE',
+      phaseLabel: 'Inside Range',
+      currentPrice: currentTicker?.lastPrice || 0,
+      statusMessage: `Syncing ${selectedSymbol} order flow...`,
+      lastUpdated: Date.now(),
+    };
+  }, [allAssetStatuses, selectedSymbol, isCandleDataAligned, candlesHTF, candlesLTF, riskAmountUsdt, currentTicker]);
 
   // Web Audio Alert Chime for Phase 3 Detection
   const playAlertChime = useCallback(() => {
@@ -225,10 +244,61 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
     });
   }, []);
 
-  // Save Forward Signals to Storage
+  // Save Forward Signals to Storage with price sanity and deduplication
   const persistSignal = useCallback((sig: SsrSignal) => {
+    if (!sig || !sig.symbol || !sig.entryPrice || !sig.stopLoss) return;
+
+    // Price Sanity Guard: Check against live ticker to prevent cross-asset contamination
+    const t = tickers.find((tick) => tick.symbol.toUpperCase() === sig.symbol.toUpperCase());
+    if (t && t.lastPrice > 0) {
+      const divergence = Math.abs(sig.entryPrice - t.lastPrice) / t.lastPrice;
+      if (divergence > 0.25) {
+        console.warn(`[SSR Ledger] Blocked invalid signal for ${sig.symbol}: entry $${sig.entryPrice} vs live $${t.lastPrice}`);
+        return;
+      }
+    }
+
+    // Structural Stop Loss Guard
+    if (sig.direction === 'LONG' && sig.stopLoss >= sig.entryPrice) return;
+    if (sig.direction === 'SHORT' && sig.stopLoss <= sig.entryPrice) return;
+
     setForwardLedger((prev) => {
-      const updated = [sig, ...prev.filter((s) => s.id !== sig.id)].slice(0, 50);
+      // Check if setup with identical ID or same symbol + direction is already active
+      const existingIdx = prev.findIndex((s) =>
+        s.id === sig.id ||
+        (s.symbol.toUpperCase() === sig.symbol.toUpperCase() &&
+         s.direction === sig.direction &&
+         ['ACTIVE', 'HIT_TP1', 'HIT_TP2'].includes(s.status) &&
+         Math.abs(s.entryPrice - sig.entryPrice) / sig.entryPrice < 0.02)
+      );
+
+      let updated: SsrSignal[];
+      if (existingIdx >= 0) {
+        updated = [...prev];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          currentPrice: sig.currentPrice || updated[existingIdx].currentPrice,
+          confidenceScore: sig.confidenceScore,
+          confidenceTier: sig.confidenceTier,
+          keyFactors: sig.keyFactors,
+        };
+      } else {
+        updated = [sig, ...prev].slice(0, 50);
+      }
+
+      try {
+        localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(updated));
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+  }, [tickers]);
+
+  // Delete individual signal from Forward Ledger
+  const deleteForwardSignal = useCallback((id: string) => {
+    setForwardLedger((prev) => {
+      const updated = prev.filter((s) => s.id !== id);
       try {
         localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(updated));
       } catch {
@@ -237,6 +307,53 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
       return updated;
     });
   }, []);
+
+  // Purge inactive/closed trades from Forward Ledger
+  const purgeInactiveForwardSignals = useCallback(() => {
+    setForwardLedger((prev) => {
+      const updated = prev.filter((s) => s.status === 'ACTIVE' || s.status === 'HIT_TP1' || s.status === 'HIT_TP2');
+      try {
+        localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(updated));
+      } catch {
+        // ignore
+      }
+      return updated;
+    });
+  }, []);
+
+  // Sanitize and purge corrupted data
+  const purgeCorruptedSignals = useCallback(() => {
+    setForwardLedger((prev) => {
+      const { sanitized } = sanitizeSsrLedger(prev, tickers);
+      try {
+        localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(sanitized));
+      } catch {
+        // ignore
+      }
+      return sanitized;
+    });
+  }, [tickers]);
+
+  // Forward Signal Ledger Metrics
+  const activeForwardCount = useMemo(
+    () => forwardLedger.filter((s) => s.status === 'ACTIVE' || s.status === 'HIT_TP1' || s.status === 'HIT_TP2').length,
+    [forwardLedger]
+  );
+  const closedForwardTrades = useMemo(
+    () => forwardLedger.filter((s) => s.realizedR !== undefined || s.status === 'STOPPED_OUT' || s.status === 'HIT_TP3'),
+    [forwardLedger]
+  );
+  const winningForwardTrades = useMemo(
+    () => closedForwardTrades.filter((s) => (s.realizedR ?? 0) > 0),
+    [closedForwardTrades]
+  );
+  const forwardWinRate = closedForwardTrades.length > 0
+    ? Number(((winningForwardTrades.length / closedForwardTrades.length) * 100).toFixed(1))
+    : 0;
+  const forwardTotalRealizedR = useMemo(
+    () => Number(closedForwardTrades.reduce((acc, s) => acc + (s.realizedR ?? 0), 0).toFixed(2)),
+    [closedForwardTrades]
+  );
 
   // --------------------------------------------------------------------------
   // Multi-Coin Live Scanner Execution
@@ -326,136 +443,49 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
     return () => clearInterval(interval);
   }, [isActive, autoScanEnabled, scanIntervalSec, allAssetStatuses.length, runLiveScan]);
 
-  // Evaluate Forward Signals Against Live Market Prices
+  // Automated Sanitization & Live Price Evaluation of Forward Signals
   useEffect(() => {
-    if (tickers.length === 0 || forwardLedger.length === 0) return;
+    if (tickers.length === 0) return;
 
-    let hasUpdates = false;
-    const tickerMap = new Map<string, CryptoTicker>();
-    tickers.forEach((t) => tickerMap.set(t.symbol.toUpperCase(), t));
+    setForwardLedger((prevLedger) => {
+      if (prevLedger.length === 0) return prevLedger;
 
-    const updated = forwardLedger.map((sig) => {
-      if (sig.status !== 'ACTIVE') return sig;
-      const t = tickerMap.get(sig.symbol.toUpperCase());
-      if (!t) return sig;
+      // 1. Sanitize against current live ticker prices (cleans cross-asset contamination and duplicates)
+      const { sanitized, purgedCount } = sanitizeSsrLedger(prevLedger, tickers);
+      let hasChanges = purgedCount > 0;
 
-      const p = t.lastPrice;
-      const high = t.highPrice;
-      const low = t.lowPrice;
+      // 2. Evaluate active and trailing signals against live market price
+      const tickerMap = new Map<string, CryptoTicker>();
+      tickers.forEach((t) => tickerMap.set(t.symbol.toUpperCase(), t));
 
-      if (sig.direction === 'LONG') {
-        if (low <= sig.stopLoss) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'STOPPED_OUT' as const,
-            currentPrice: p,
-            exitPrice: sig.stopLoss,
-            realizedR: -1.0,
-            exitTime: Date.now(),
-            exitReason: 'Full Stop Loss',
-          };
+      const evaluated = sanitized.map((sig) => {
+        const t = tickerMap.get(sig.symbol.toUpperCase());
+        if (!t || !t.lastPrice || t.lastPrice <= 0) return sig;
+
+        const updated = evaluateSsrForwardSignal(sig, t.lastPrice);
+        if (
+          updated.status !== sig.status ||
+          updated.realizedR !== sig.realizedR ||
+          updated.currentPrice !== sig.currentPrice ||
+          updated.trailingStopPrice !== sig.trailingStopPrice ||
+          updated.liveR !== sig.liveR
+        ) {
+          hasChanges = true;
         }
-        if (high >= sig.tp3) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP3' as const,
-            currentPrice: p,
-            exitPrice: sig.tp3,
-            realizedR: 2.75,
-            exitTime: Date.now(),
-            exitReason: 'TP3 Max Runner',
-          };
+        return updated;
+      });
+
+      if (hasChanges) {
+        try {
+          localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(evaluated));
+        } catch {
+          // ignore
         }
-        if (high >= sig.tp2) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP2' as const,
-            currentPrice: p,
-            exitPrice: sig.tp2,
-            realizedR: 1.75,
-            exitTime: Date.now(),
-            exitReason: 'TP2 Target 1:3',
-          };
-        }
-        if (high >= sig.tp1) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP1' as const,
-            currentPrice: p,
-            exitPrice: sig.tp1,
-            realizedR: 1.0,
-            exitTime: Date.now(),
-            exitReason: 'TP1 50% Scaled + BE Lock',
-          };
-        }
-      } else {
-        // SHORT
-        if (high >= sig.stopLoss) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'STOPPED_OUT' as const,
-            currentPrice: p,
-            exitPrice: sig.stopLoss,
-            realizedR: -1.0,
-            exitTime: Date.now(),
-            exitReason: 'Full Stop Loss',
-          };
-        }
-        if (low <= sig.tp3) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP3' as const,
-            currentPrice: p,
-            exitPrice: sig.tp3,
-            realizedR: 2.75,
-            exitTime: Date.now(),
-            exitReason: 'TP3 Max Runner',
-          };
-        }
-        if (low <= sig.tp2) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP2' as const,
-            currentPrice: p,
-            exitPrice: sig.tp2,
-            realizedR: 1.75,
-            exitTime: Date.now(),
-            exitReason: 'TP2 Target 1:3',
-          };
-        }
-        if (low <= sig.tp1) {
-          hasUpdates = true;
-          return {
-            ...sig,
-            status: 'HIT_TP1' as const,
-            currentPrice: p,
-            exitPrice: sig.tp1,
-            realizedR: 1.0,
-            exitTime: Date.now(),
-            exitReason: 'TP1 50% Scaled + BE Lock',
-          };
-        }
+        return evaluated;
       }
-
-      return { ...sig, currentPrice: p };
+      return prevLedger;
     });
-
-    if (hasUpdates) {
-      setForwardLedger(updated);
-      try {
-        localStorage.setItem('vp_ssr_forward_ledger', JSON.stringify(updated));
-      } catch {
-        // ignore
-      }
-    }
-  }, [tickers, forwardLedger]);
+  }, [tickers]);
 
   // --------------------------------------------------------------------------
   // Backtest Execution
@@ -1815,21 +1845,82 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                 <span>Forward Signal Ledger & Paper Trading Tracker</span>
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Automatically monitors forward live signals against real Binance WebSocket/REST prices to verify out-of-sample edge.
+                Automatically monitors live institutional SSR triggers against real-time Binance price action to verify edge.
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                setForwardLedger([]);
-                localStorage.removeItem('vp_ssr_forward_ledger');
-              }}
-              className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-rose-400 font-mono transition-colors flex items-center gap-1.5"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Clear Ledger</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={purgeCorruptedSignals}
+                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-indigo-300 font-mono transition-colors flex items-center gap-1.5"
+                title="Sanitize corrupted cross-symbol anomalies and deduplicate rows"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Sanitize & Fix</span>
+              </button>
+
+              {closedForwardTrades.length > 0 && (
+                <button
+                  type="button"
+                  onClick={purgeInactiveForwardSignals}
+                  className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-amber-300 font-mono transition-colors flex items-center gap-1.5"
+                  title="Remove closed or stopped trades"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Purge Inactive ({closedForwardTrades.length})</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setForwardLedger([]);
+                  localStorage.removeItem('vp_ssr_forward_ledger');
+                }}
+                className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs text-rose-400 font-mono transition-colors flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Clear All</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Forward Testing Performance Overview Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 font-mono">
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800">
+              <span className="text-[10px] text-slate-500 uppercase block">Total Setups</span>
+              <strong className="text-lg font-bold text-white">{forwardLedger.length}</strong>
+              <span className="text-[10px] text-slate-400 block font-sans">Tracked signals</span>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800">
+              <span className="text-[10px] text-slate-500 uppercase block">Active In-Play</span>
+              <strong className="text-lg font-bold text-sky-400">{activeForwardCount}</strong>
+              <span className="text-[10px] text-slate-400 block font-sans">Trailing live prices</span>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800">
+              <span className="text-[10px] text-slate-500 uppercase block">Closed Trades</span>
+              <strong className="text-lg font-bold text-slate-200">{closedForwardTrades.length}</strong>
+              <span className="text-[10px] text-slate-400 block font-sans">{winningForwardTrades.length} Won / {closedForwardTrades.length - winningForwardTrades.length} Lost</span>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800">
+              <span className="text-[10px] text-slate-500 uppercase block">Win Rate</span>
+              <strong className={`text-lg font-bold ${forwardWinRate >= 50 ? 'text-emerald-400' : 'text-slate-200'}`}>
+                {forwardWinRate}%
+              </strong>
+              <span className="text-[10px] text-slate-400 block font-sans">Closed outcome rate</span>
+            </div>
+
+            <div className="p-3 rounded-lg bg-slate-900 border border-slate-800">
+              <span className="text-[10px] text-slate-500 uppercase block">Net Realized R</span>
+              <strong className={`text-lg font-bold ${forwardTotalRealizedR >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {forwardTotalRealizedR >= 0 ? '+' : ''}{forwardTotalRealizedR} R
+              </strong>
+              <span className="text-[10px] text-slate-400 block font-sans">Cumulative expectancy</span>
+            </div>
           </div>
 
           {forwardLedger.length > 0 ? (
@@ -1842,52 +1933,130 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                     <th className="py-2.5 px-3">Direction</th>
                     <th className="py-2.5 px-3">Limit Entry (FVG)</th>
                     <th className="py-2.5 px-3">Stop Loss</th>
-                    <th className="py-2.5 px-3">TP1 (1:2)</th>
+                    <th className="py-2.5 px-3">Targets (TP1 · TP2 · TP3)</th>
                     <th className="py-2.5 px-3">Current Market</th>
                     <th className="py-2.5 px-3">Status</th>
-                    <th className="py-2.5 px-3">Realized PnL</th>
+                    <th className="py-2.5 px-3">PnL / Outcome</th>
+                    <th className="py-2.5 px-3 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 tabular-nums">
-                  {forwardLedger.map((sig) => (
-                    <tr key={sig.id} className="hover:bg-slate-800/40 transition-colors">
-                      <td className="py-3 px-3 text-slate-400">{sig.timeString}</td>
-                      <td className="py-3 px-3 font-bold text-white">{sig.symbol}</td>
-                      <td className="py-3 px-3">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          sig.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                        }`}>
-                          {sig.direction}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 font-bold text-sky-400">${sig.entryPrice.toLocaleString()}</td>
-                      <td className="py-3 px-3 font-bold text-rose-400">${sig.stopLoss.toLocaleString()}</td>
-                      <td className="py-3 px-3 font-bold text-emerald-400">${sig.tp1.toLocaleString()}</td>
-                      <td className="py-3 px-3 font-bold text-slate-200">
-                        ${sig.currentPrice ? sig.currentPrice.toLocaleString() : '—'}
-                      </td>
-                      <td className="py-3 px-3">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          sig.status.startsWith('HIT')
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : sig.status === 'STOPPED_OUT'
-                            ? 'bg-rose-500/20 text-rose-400'
-                            : 'bg-indigo-500/20 text-indigo-300'
-                        }`}>
-                          {sig.status.replace(/_/g, ' ')}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 font-bold">
-                        {sig.realizedR !== undefined ? (
-                          <span className={sig.realizedR > 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                            {sig.realizedR >= 0 ? '+' : ''}{sig.realizedR} R
+                  {forwardLedger.map((sig) => {
+                    const isClosed = sig.realizedR !== undefined || sig.status === 'STOPPED_OUT' || sig.status === 'HIT_TP3';
+                    const hasTrailingStop = sig.trailingStopPrice && sig.trailingStopPrice !== sig.stopLoss;
+
+                    return (
+                      <tr key={sig.id} className="hover:bg-slate-800/40 transition-colors">
+                        <td className="py-3 px-3 text-slate-400 whitespace-nowrap">{sig.timeString}</td>
+                        <td className="py-3 px-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSelectSymbol(sig.symbol);
+                              setActiveTab('LIVE');
+                            }}
+                            className="font-bold text-white hover:text-indigo-400 transition-colors flex items-center gap-1 text-left"
+                            title="Inspect in Live Terminal"
+                          >
+                            <span>{sig.symbol}</span>
+                            <Eye className="w-3 h-3 text-slate-500 opacity-60" />
+                          </button>
+                        </td>
+                        <td className="py-3 px-3">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            sig.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                          }`}>
+                            {sig.direction}
                           </span>
-                        ) : (
-                          <span className="text-slate-500">Live in play</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td className="py-3 px-3 font-bold text-sky-400">${sig.entryPrice.toLocaleString()}</td>
+                        <td className="py-3 px-3">
+                          <div className="font-bold text-rose-400">${sig.stopLoss.toLocaleString()}</div>
+                          {hasTrailingStop && (
+                            <span className="text-[10px] text-amber-300 font-sans block">
+                              SL Trailed: ${sig.trailingStopPrice?.toLocaleString()}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-[11px] text-slate-300">
+                          <div>TP1: <span className="font-bold text-emerald-400">${sig.tp1.toLocaleString()}</span></div>
+                          <div className="text-[10px] text-slate-400">TP2: ${sig.tp2.toLocaleString()} · TP3: ${sig.tp3.toLocaleString()}</div>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="font-bold text-slate-200">
+                            ${sig.currentPrice ? sig.currentPrice.toLocaleString() : '—'}
+                          </div>
+                          {!isClosed && sig.liveR !== undefined && (
+                            <span className={`text-[10px] font-sans block ${sig.liveR >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {sig.liveR >= 0 ? '+' : ''}{sig.liveR} R ({sig.pnlPercent ? (sig.pnlPercent >= 0 ? '+' : '') + sig.pnlPercent + '%' : ''})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3">
+                          {sig.status === 'HIT_TP3' ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/30 text-emerald-300 border border-emerald-500/40">
+                              HIT TP3 (Max Target)
+                            </span>
+                          ) : sig.status === 'HIT_TP2' ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                              HIT TP2 (Trailed TP1)
+                            </span>
+                          ) : sig.status === 'HIT_TP1' ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                              HIT TP1 (BE Locked)
+                            </span>
+                          ) : sig.status === 'STOPPED_OUT' ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                              STOPPED OUT
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                              ACTIVE (Live in play)
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 font-bold">
+                          {sig.realizedR !== undefined ? (
+                            <div>
+                              <span className={sig.realizedR > 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                                {sig.realizedR >= 0 ? '+' : ''}{sig.realizedR} R
+                              </span>
+                              {sig.exitReason && (
+                                <span className="text-[10px] text-slate-500 font-sans block truncate max-w-[150px]" title={sig.exitReason}>
+                                  {sig.exitReason}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-sky-400 text-xs font-sans">In Progress</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onSelectSymbol(sig.symbol);
+                                setActiveTab('LIVE');
+                              }}
+                              className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-indigo-300 transition-colors"
+                              title="Inspect Setup in Terminal"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deleteForwardSignal(sig.id)}
+                              className="p-1.5 rounded hover:bg-slate-800 text-slate-500 hover:text-rose-400 transition-colors"
+                              title="Delete Signal from Ledger"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

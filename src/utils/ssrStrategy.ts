@@ -102,6 +102,10 @@ export interface SsrSignal {
   exitPrice?: number;
   exitTime?: number;
   exitReason?: string;
+  trailingStopPrice?: number;
+  highestPriceSinceEntry?: number;
+  lowestPriceSinceEntry?: number;
+  liveR?: number;
 }
 
 export interface SsrAssetScanResult {
@@ -609,11 +613,15 @@ export function findLiveSsrSignal(
 
   const confidenceTier: 'A+' | 'A' | 'B+' = confidenceScore >= 90 ? 'A+' : confidenceScore >= 80 ? 'A' : 'B+';
 
+  // Stable setup ID and timestamp based on structural MSS displacement time
+  const setupTimestamp = mss.time;
+  const signalId = `ssr-${symbol.toUpperCase()}-${direction}-${setupTimestamp}`;
+
   return {
-    id: `ssr-${symbol}-${currentTime}`,
-    symbol,
-    time: currentTime,
-    timeString: formatSsrTime(currentTime),
+    id: signalId,
+    symbol: symbol.toUpperCase(),
+    time: setupTimestamp,
+    timeString: formatSsrTime(setupTimestamp),
     direction,
     phase: 'PHASE_3_FVG_RETURN',
     phaseDescription: `Phase 3 Active: Price retracing into ${direction === 'LONG' ? 'Bullish' : 'Bearish'} FVG ($${entryPrice}) after ${sweptPool.type} sweep & MSS shift`,
@@ -644,6 +652,10 @@ export function findLiveSsrSignal(
     ],
     status: 'ACTIVE',
     currentPrice: currentBar.close,
+    trailingStopPrice: formatSsrPrice(stopLoss),
+    highestPriceSinceEntry: currentBar.high,
+    lowestPriceSinceEntry: currentBar.low,
+    liveR: 0.0,
     pnlPercent: 0.0,
   };
 }
@@ -1506,4 +1518,324 @@ export function calculateSsrPositionSize(
     liquidationPriceEst: formatSsrPrice(liquidationPriceEst),
     isLeverageSafe,
   };
+}
+
+// ============================================================================
+// 10. Forward Paper Trading Evaluator & Sanitizer
+// ============================================================================
+
+/**
+ * Evaluates an active forward trade against real-time Binance market prices.
+ * Strictly uses live price action since entry (NOT 24h historical extremes)
+ * and executes dynamic trailing stop:
+ * - TP1 reached: 50% profits booked (+0.65R net), stop moves to Breakeven (entryPrice).
+ * - TP2 reached: 25% profits booked, stop moves to TP1.
+ * - TP3 reached: Final 25% runner booked (+2.08R net), trade closed as complete triumph.
+ * - Stop hit: Exits at effective stop (0.0R net if BE, -1.0R if initial).
+ */
+export function evaluateSsrForwardSignal(
+  sig: SsrSignal,
+  currentMarketPrice: number
+): SsrSignal {
+  if (!sig || !Number.isFinite(currentMarketPrice) || currentMarketPrice <= 0) {
+    return sig;
+  }
+
+  // Already closed trades: only update current price for reference, don't alter realized outcomes
+  if (sig.status === 'STOPPED_OUT' || sig.status === 'HIT_TP3' || sig.exitTime) {
+    return { ...sig, currentPrice: currentMarketPrice };
+  }
+
+  const p = currentMarketPrice;
+  const highestPrice = Math.max(sig.highestPriceSinceEntry ?? p, p);
+  const lowestPrice = Math.min(sig.lowestPriceSinceEntry ?? p, p);
+  const effectiveStop = sig.trailingStopPrice ?? sig.stopLoss;
+  const riskUnit = Math.abs(sig.entryPrice - sig.stopLoss);
+
+  if (riskUnit <= 0) {
+    return { ...sig, currentPrice: p };
+  }
+
+  const isLong = sig.direction === 'LONG';
+  const liveR = isLong
+    ? Number(((p - sig.entryPrice) / riskUnit).toFixed(2))
+    : Number(((sig.entryPrice - p) / riskUnit).toFixed(2));
+  const pnlPercent = isLong
+    ? Number((((p - sig.entryPrice) / sig.entryPrice) * 100).toFixed(2))
+    : Number((((sig.entryPrice - p) / sig.entryPrice) * 100).toFixed(2));
+
+  const now = Date.now();
+
+  if (isLong) {
+    // 1. Check Stop Loss / Breakeven / Trailed Stop Hit
+    if (p <= effectiveStop) {
+      if (sig.status === 'HIT_TP2') {
+        // Trailed stop hit at TP1
+        return {
+          ...sig,
+          status: 'HIT_TP2',
+          currentPrice: p,
+          exitPrice: effectiveStop,
+          realizedR: 1.53,
+          exitTime: now,
+          exitReason: 'Trailed SL Hit at TP1 (75% Profit Locked)',
+          pnlPercent,
+          liveR: 1.53,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      } else if (sig.status === 'HIT_TP1') {
+        // Breakeven stop hit after TP1
+        return {
+          ...sig,
+          status: 'HIT_TP1',
+          currentPrice: p,
+          exitPrice: effectiveStop,
+          realizedR: 0.65,
+          exitTime: now,
+          exitReason: 'Breakeven SL Hit (50% Booked at TP1)',
+          pnlPercent,
+          liveR: 0.65,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      } else {
+        // Initial Stop Loss hit
+        return {
+          ...sig,
+          status: 'STOPPED_OUT',
+          currentPrice: p,
+          exitPrice: sig.stopLoss,
+          realizedR: -1.0,
+          exitTime: now,
+          exitReason: 'Initial Stop Loss Hit',
+          pnlPercent,
+          liveR: -1.0,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      }
+    }
+
+    // 2. Check TP3 Target Hit
+    if (p >= sig.tp3) {
+      return {
+        ...sig,
+        status: 'HIT_TP3',
+        currentPrice: p,
+        exitPrice: sig.tp3,
+        realizedR: 2.08,
+        exitTime: now,
+        exitReason: 'TP3 Runner Target Hit',
+        pnlPercent,
+        liveR: 2.08,
+        trailingStopPrice: effectiveStop,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+
+    // 3. Check TP2 Target Hit (Active trailing)
+    if (p >= sig.tp2 && sig.status !== 'HIT_TP2') {
+      return {
+        ...sig,
+        status: 'HIT_TP2',
+        currentPrice: p,
+        trailingStopPrice: sig.tp1, // Move stop loss to TP1 to secure +1.53R
+        pnlPercent,
+        liveR,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+
+    // 4. Check TP1 Target Hit (Active trailing)
+    if (p >= sig.tp1 && sig.status === 'ACTIVE') {
+      return {
+        ...sig,
+        status: 'HIT_TP1',
+        currentPrice: p,
+        trailingStopPrice: sig.entryPrice, // Move stop loss to Breakeven
+        pnlPercent,
+        liveR,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+  } else {
+    // SHORT Direction
+    // 1. Check Stop Loss / Breakeven / Trailed Stop Hit
+    if (p >= effectiveStop) {
+      if (sig.status === 'HIT_TP2') {
+        return {
+          ...sig,
+          status: 'HIT_TP2',
+          currentPrice: p,
+          exitPrice: effectiveStop,
+          realizedR: 1.53,
+          exitTime: now,
+          exitReason: 'Trailed SL Hit at TP1 (75% Profit Locked)',
+          pnlPercent,
+          liveR: 1.53,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      } else if (sig.status === 'HIT_TP1') {
+        return {
+          ...sig,
+          status: 'HIT_TP1',
+          currentPrice: p,
+          exitPrice: effectiveStop,
+          realizedR: 0.65,
+          exitTime: now,
+          exitReason: 'Breakeven SL Hit (50% Booked at TP1)',
+          pnlPercent,
+          liveR: 0.65,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      } else {
+        return {
+          ...sig,
+          status: 'STOPPED_OUT',
+          currentPrice: p,
+          exitPrice: sig.stopLoss,
+          realizedR: -1.0,
+          exitTime: now,
+          exitReason: 'Initial Stop Loss Hit',
+          pnlPercent,
+          liveR: -1.0,
+          trailingStopPrice: effectiveStop,
+          highestPriceSinceEntry: highestPrice,
+          lowestPriceSinceEntry: lowestPrice,
+        };
+      }
+    }
+
+    // 2. Check TP3 Target Hit
+    if (p <= sig.tp3) {
+      return {
+        ...sig,
+        status: 'HIT_TP3',
+        currentPrice: p,
+        exitPrice: sig.tp3,
+        realizedR: 2.08,
+        exitTime: now,
+        exitReason: 'TP3 Runner Target Hit',
+        pnlPercent,
+        liveR: 2.08,
+        trailingStopPrice: effectiveStop,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+
+    // 3. Check TP2 Target Hit
+    if (p <= sig.tp2 && sig.status !== 'HIT_TP2') {
+      return {
+        ...sig,
+        status: 'HIT_TP2',
+        currentPrice: p,
+        trailingStopPrice: sig.tp1,
+        pnlPercent,
+        liveR,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+
+    // 4. Check TP1 Target Hit
+    if (p <= sig.tp1 && sig.status === 'ACTIVE') {
+      return {
+        ...sig,
+        status: 'HIT_TP1',
+        currentPrice: p,
+        trailingStopPrice: sig.entryPrice,
+        pnlPercent,
+        liveR,
+        highestPriceSinceEntry: highestPrice,
+        lowestPriceSinceEntry: lowestPrice,
+      };
+    }
+  }
+
+  // Active in play - return updated metrics
+  return {
+    ...sig,
+    currentPrice: p,
+    pnlPercent,
+    liveR,
+    trailingStopPrice: effectiveStop,
+    highestPriceSinceEntry: highestPrice,
+    lowestPriceSinceEntry: lowestPrice,
+  };
+}
+
+/**
+ * Sanitizes the forward ledger:
+ * 1. Purges cross-contaminated price anomalies (where entry diverges > 35% from current market ticker).
+ * 2. Purges logically invalid setups (e.g. stop loss on wrong side of entry).
+ * 3. Deduplicates identical active signals (same coin + direction + price level).
+ */
+export function sanitizeSsrLedger(
+  signals: SsrSignal[],
+  tickers: { symbol: string; lastPrice: number }[]
+): { sanitized: SsrSignal[]; purgedCount: number } {
+  if (!Array.isArray(signals)) return { sanitized: [], purgedCount: 0 };
+  const tickerMap = new Map<string, number>();
+  tickers.forEach((t) => {
+    if (t.symbol && t.lastPrice > 0) {
+      tickerMap.set(t.symbol.toUpperCase(), t.lastPrice);
+    }
+  });
+
+  const seenKeys = new Set<string>();
+  const sanitized: SsrSignal[] = [];
+  let purgedCount = 0;
+
+  for (const sig of signals) {
+    if (!sig || !sig.symbol || !sig.entryPrice || !sig.stopLoss) {
+      purgedCount++;
+      continue;
+    }
+
+    const sym = sig.symbol.toUpperCase();
+    const livePrice = tickerMap.get(sym);
+
+    // 1. Cross-Symbol Contamination Check
+    if (livePrice && livePrice > 0) {
+      const divergence = Math.abs(sig.entryPrice - livePrice) / livePrice;
+      if (divergence > 0.35) {
+        purgedCount++;
+        continue;
+      }
+    }
+
+    // 2. Structural Sanity Check
+    if (sig.direction === 'LONG' && sig.stopLoss >= sig.entryPrice) {
+      purgedCount++;
+      continue;
+    }
+    if (sig.direction === 'SHORT' && sig.stopLoss <= sig.entryPrice) {
+      purgedCount++;
+      continue;
+    }
+
+    // 3. Deduplication Check
+    const dedupKey = `${sym}_${sig.direction}_${Math.round(sig.entryPrice * 100)}`;
+    if (seenKeys.has(dedupKey)) {
+      purgedCount++;
+      continue;
+    }
+    seenKeys.add(dedupKey);
+
+    sanitized.push(sig);
+  }
+
+  return { sanitized, purgedCount };
 }
