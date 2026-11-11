@@ -11,6 +11,7 @@ import {
   detectMarketStructureShift,
   detectFairValueGap,
   findLiveSsrSignal,
+  scanSsrAssetStatus,
   runSsrBacktest,
   calculateSsrPositionSize,
 } from './ssrStrategy';
@@ -171,4 +172,44 @@ test('runSsrBacktest outputs full institutional metrics and success evaluation',
   assert.ok(typeof summary.profitPercentEquity === 'number');
   assert.ok(summary.verdictTitle.length > 0);
   assert.ok(typeof summary.isStrategySuccess === 'boolean');
+});
+
+test('scanSsrAssetStatus classifies phase correctly across market regimes', () => {
+  const candlesHTF = createMockCandles(40, 100, 1, 3600000);
+  candlesHTF[15].high = 160;
+  candlesHTF[15].close = 155;
+  candlesHTF[25].low = 80;
+  candlesHTF[25].close = 85;
+
+  // Case 1: Inside Range (no recent sweep)
+  const rangeCandles = createMockCandles(40, 110, 0.1, 300000);
+  const statusRange = scanSsrAssetStatus(candlesHTF, rangeCandles, 'SOLUSDT', 100);
+  assert.strictEqual(statusRange.symbol, 'SOLUSDT');
+  assert.strictEqual(statusRange.phase, 'INSIDE_RANGE');
+  assert.ok(statusRange.nearestBsl && statusRange.nearestBsl >= 160);
+  assert.ok(statusRange.nearestSsl && statusRange.nearestSsl <= 80);
+
+  // Case 2: Phase 1 Liquidity Sweep (BSL pierced and rejected, but no MSS displacement)
+  const ltfBaseTime = 1730000000000 + 30 * 3600000;
+  const sweepCandles: Candle[] = [];
+  for (let i = 0; i < 40; i++) {
+    const time = ltfBaseTime + i * 300000;
+    sweepCandles.push({
+      time,
+      open: 155,
+      high: 156,
+      low: 154,
+      close: 155,
+      volume: 1000,
+      quoteVolume: 155000,
+    });
+  }
+  // Inject BSL sweep at recent bar (within last 8 bars: index 35)
+  sweepCandles[35].high = 162; // sweeps 160
+  sweepCandles[35].close = 158;
+  sweepCandles[39].close = 157; // closed below 160
+  const statusSweep = scanSsrAssetStatus(candlesHTF, sweepCandles, 'ETHUSDT', 100);
+  assert.strictEqual(statusSweep.symbol, 'ETHUSDT');
+  assert.ok(statusSweep.phase === 'PHASE_1_SWEEP' || statusSweep.phase === 'PHASE_2_MSS');
+  assert.strictEqual(statusSweep.liquidityPoolType, 'BSL');
 });

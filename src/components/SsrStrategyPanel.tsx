@@ -41,15 +41,26 @@ import {
   ExternalLink,
   Flame,
   AlertTriangle,
+  RefreshCw,
+  Radio,
+  Search,
+  Volume2,
+  VolumeX,
+  Eye,
+  Check,
+  Plus,
 } from 'lucide-react';
 import {
   runSsrBacktest,
   findLiveSsrSignal,
+  scanSsrAssetStatus,
   calculateSsrPositionSize,
   formatSsrPrice,
   formatSsrTime,
   formatSsrDisplayDateTime,
   type SsrSignal,
+  type SsrAssetScanResult,
+  type SsrPhase,
   type SsrBacktestSummary,
   type SsrBacktestTrade,
   type SsrPositionSizingResult,
@@ -120,9 +131,23 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
     }
   });
 
-  // Live Scanner State
+  // Live Scanner & Continuous Auto-Scan Engine States
   const [scannerSignals, setScannerSignals] = useState<SsrSignal[]>([]);
+  const [allAssetStatuses, setAllAssetStatuses] = useState<SsrAssetScanResult[]>([]);
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [autoScanEnabled, setAutoScanEnabled] = useState<boolean>(true);
+  const [scanIntervalSec, setScanIntervalSec] = useState<number>(10);
+  const [countdown, setCountdown] = useState<number>(10);
+  const [lastScanTime, setLastScanTime] = useState<number | null>(null);
+  const [filterPhase, setFilterPhase] = useState<'ALL' | 'ACTIVE_SETUPS' | 'PHASE_3_FVG_RETURN' | 'PHASE_2_MSS' | 'PHASE_1_SWEEP' | 'INSIDE_RANGE'>('ALL');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [recentAlertBanner, setRecentAlertBanner] = useState<{
+    message: string;
+    symbol: string;
+    phase: string;
+    time: number;
+  } | null>(null);
 
   // Position Sizing Calculator Inputs
   const [calcEntry, setCalcEntry] = useState<number>(0);
@@ -137,6 +162,38 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
     if (candlesHTF.length < 15 || candlesLTF.length < 25) return null;
     return findLiveSsrSignal(candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt);
   }, [candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt]);
+
+  // Selected Asset Comprehensive SMC Status
+  const selectedAssetStatus: SsrAssetScanResult | null = useMemo(() => {
+    const fromScan = allAssetStatuses.find((s) => s.symbol.toUpperCase() === selectedSymbol.toUpperCase());
+    if (fromScan) return fromScan;
+    if (candlesHTF.length >= 10 && candlesLTF.length >= 10) {
+      return scanSsrAssetStatus(candlesHTF, candlesLTF, selectedSymbol, riskAmountUsdt);
+    }
+    return null;
+  }, [allAssetStatuses, selectedSymbol, candlesHTF, candlesLTF, riskAmountUsdt]);
+
+  // Web Audio Alert Chime for Phase 3 Detection
+  const playAlertChime = useCallback(() => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+      osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.12); // A5
+      gain.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.35);
+    } catch {
+      // Audio playback blocked or unavailable
+    }
+  }, []);
 
   // Sync calculator defaults with active signal
   useEffect(() => {
@@ -178,14 +235,49 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
   // --------------------------------------------------------------------------
   // Multi-Coin Live Scanner Execution
   // --------------------------------------------------------------------------
-  const runLiveScan = useCallback(async () => {
+  const runLiveScan = useCallback(async (isManual = false) => {
     setIsScanning(true);
     try {
-      const res = await fetch('/api/ssr/scan');
+      const url = `/api/ssr/scan?activeSymbol=${encodeURIComponent(selectedSymbol)}${isManual ? '&force=true' : ''}`;
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
+        
+        // Merge with live ticker prices/volumes
+        if (Array.isArray(data.assetStatuses)) {
+          const tickerMap = new Map<string, CryptoTicker>();
+          tickers.forEach((t) => tickerMap.set(t.symbol.toUpperCase(), t));
+
+          const decorated: SsrAssetScanResult[] = data.assetStatuses.map((st: SsrAssetScanResult) => {
+            const t = tickerMap.get(st.symbol.toUpperCase());
+            return {
+              ...st,
+              priceChangePercent24h: t?.priceChangePercent,
+              quoteVolume24h: t?.quoteVolume,
+              currentPrice: t?.lastPrice || st.currentPrice,
+            };
+          });
+
+          setAllAssetStatuses(decorated);
+        }
+
         if (Array.isArray(data.signals)) {
           setScannerSignals(data.signals);
+
+          // If new Phase 3 signal detected, trigger banner & chime
+          if (data.signals.length > 0) {
+            const top = data.signals[0];
+            setRecentAlertBanner({
+              message: `${top.symbol} triggered Phase 3 ${top.direction} Limit Entry at $${top.entryPrice.toLocaleString()} (Tier ${top.confidenceTier})`,
+              symbol: top.symbol,
+              phase: 'PHASE_3_FVG_RETURN',
+              time: Date.now(),
+            });
+            if (soundEnabled) {
+              playAlertChime();
+            }
+          }
+
           // Automatically register high-conviction signals to forward ledger
           data.signals.forEach((sig: SsrSignal) => {
             if (sig.confidenceTier === 'A+') {
@@ -193,21 +285,40 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
             }
           });
         }
+
+        setLastScanTime(Date.now());
       }
-    } catch {
-      // ignore network errors
+    } catch (err) {
+      console.error('SSR live scan failed:', err);
     } finally {
       setIsScanning(false);
+      setCountdown(scanIntervalSec);
     }
-  }, [persistSignal]);
+  }, [selectedSymbol, tickers, soundEnabled, playAlertChime, persistSignal, scanIntervalSec]);
 
-  // Periodic scan every 30s when tab is active
+  // Recurring Auto-Scan Countdown Loop
   useEffect(() => {
     if (!isActive) return;
-    runLiveScan();
-    const interval = setInterval(runLiveScan, 30000);
+
+    // Run initial scan immediately if no assets loaded yet
+    if (allAssetStatuses.length === 0) {
+      runLiveScan(false);
+    }
+
+    if (!autoScanEnabled) return;
+
+    const interval = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          runLiveScan(false);
+          return scanIntervalSec;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
     return () => clearInterval(interval);
-  }, [isActive, runLiveScan]);
+  }, [isActive, autoScanEnabled, scanIntervalSec, allAssetStatuses.length, runLiveScan]);
 
   // Evaluate Forward Signals Against Live Market Prices
   useEffect(() => {
@@ -628,17 +739,113 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
           </button>
         </div>
 
-        {/* Live Scan Trigger */}
-        <button
-          type="button"
-          onClick={runLiveScan}
-          disabled={isScanning}
-          className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-mono text-slate-300 flex items-center gap-1.5 transition-colors disabled:opacity-50"
-        >
-          <RotateCcw className={`w-3.5 h-3.5 text-indigo-400 ${isScanning ? 'animate-spin' : ''}`} />
-          <span>{isScanning ? 'Scanning Binance...' : 'Rescan Markets'}</span>
-        </button>
+        {/* Continuous Auto-Scan Controller Bar */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Auto-Scan Toggle Switch */}
+          <button
+            type="button"
+            onClick={() => setAutoScanEnabled((prev) => !prev)}
+            className={`px-3 py-1.5 rounded-lg border text-xs font-mono font-semibold flex items-center gap-2 transition-all ${
+              autoScanEnabled
+                ? 'bg-emerald-950/50 border-emerald-500/50 text-emerald-300 shadow-sm shadow-emerald-950'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-300'
+            }`}
+          >
+            <span className="relative flex h-2 w-2">
+              {autoScanEnabled && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              )}
+              <span className={`relative inline-flex rounded-full h-2 w-2 ${autoScanEnabled ? 'bg-emerald-400' : 'bg-slate-600'}`}></span>
+            </span>
+            <span>{autoScanEnabled ? 'Auto-Scan ON' : 'Auto-Scan PAUSED'}</span>
+          </button>
+
+          {/* Countdown & Interval Selector */}
+          {autoScanEnabled && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px] font-mono text-slate-300">
+              <Clock className="w-3 h-3 text-sky-400 animate-pulse" />
+              <span>Auto-scan in: <strong className="text-white font-bold">{countdown}s</strong></span>
+              <div className="flex items-center ml-1 pl-1.5 border-l border-slate-800 gap-1 text-[10px]">
+                {[8, 10, 15, 30].map((sec) => (
+                  <button
+                    key={sec}
+                    type="button"
+                    onClick={() => {
+                      setScanIntervalSec(sec);
+                      setCountdown(sec);
+                    }}
+                    className={`px-1.5 py-0.5 rounded transition-colors ${
+                      scanIntervalSec === sec
+                        ? 'bg-indigo-600 text-white font-bold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {sec}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Sound Alert Toggle */}
+          <button
+            type="button"
+            onClick={() => setSoundEnabled((prev) => !prev)}
+            className={`px-2.5 py-1.5 rounded-lg border text-xs font-mono flex items-center gap-1.5 transition-colors ${
+              soundEnabled
+                ? 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                : 'bg-slate-900/60 border-slate-800 text-slate-500'
+            }`}
+            title={soundEnabled ? 'Audio alerts enabled for Phase 3 setups' : 'Audio alerts muted'}
+          >
+            {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-emerald-400" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
+          </button>
+
+          {/* Instant Manual Rescan Button */}
+          <button
+            type="button"
+            onClick={() => runLiveScan(true)}
+            disabled={isScanning}
+            className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-mono text-slate-300 flex items-center gap-1.5 transition-colors disabled:opacity-50"
+          >
+            <RotateCcw className={`w-3.5 h-3.5 text-indigo-400 ${isScanning ? 'animate-spin' : ''}`} />
+            <span>{isScanning ? 'Scanning All 20 Coins...' : 'Scan All Coins'}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Real-time Institutional Alert Banner */}
+      {recentAlertBanner && (
+        <div className="bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-3.5 flex items-center justify-between text-xs font-mono text-emerald-200">
+          <div className="flex items-center gap-2.5">
+            <span className="relative flex h-3 w-3">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+            </span>
+            <span className="font-bold text-white uppercase tracking-wider">⚡ Institutional Alert:</span>
+            <span>{recentAlertBanner.message}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                onSelectSymbol(recentAlertBanner.symbol);
+                setRecentAlertBanner(null);
+              }}
+              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[11px] font-bold transition-colors"
+            >
+              Inspect Setup
+            </button>
+            <button
+              type="button"
+              onClick={() => setRecentAlertBanner(null)}
+              className="text-slate-400 hover:text-white text-xs px-1"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ==================================================================== */}
       {/* 3. TAB 1: Live Scanner & Signal Execution Terminal                   */}
@@ -655,14 +862,26 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                 <h3 className="text-base font-bold text-white flex items-center gap-2 mt-0.5">
                   <span>Current Status:</span>
                   {activeSignal ? (
-                    <span className={`px-2.5 py-0.5 rounded text-xs font-mono font-bold ${
-                      activeSignal.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                    <span className={`px-2.5 py-0.5 rounded text-xs font-mono font-bold flex items-center gap-1.5 ${
+                      activeSignal.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                     }`}>
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
                       {activeSignal.direction} SETUP READY (Phase 3 FVG Return)
                     </span>
+                  ) : selectedAssetStatus?.phase === 'PHASE_2_MSS' ? (
+                    <span className="px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-sky-400"></span>
+                      Phase 2: MSS Displacement Confirmed ({selectedAssetStatus.direction})
+                    </span>
+                  ) : selectedAssetStatus?.phase === 'PHASE_1_SWEEP' ? (
+                    <span className="px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-purple-500/20 text-purple-400 border border-purple-500/30 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-purple-400"></span>
+                      Phase 1: Liquidity Swept ({selectedAssetStatus.liquidityPoolType})
+                    </span>
                   ) : (
-                    <span className="text-slate-400 font-mono text-xs font-normal">
-                      Scanning for Liquidity Sweep & MSS Displacement...
+                    <span className="text-slate-400 font-mono text-xs font-normal flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+                      Surveillance Active · Inside Structural Range
                     </span>
                   )}
                 </h3>
@@ -675,7 +894,7 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                     onClick={() => persistSignal(activeSignal)}
                     className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-mono font-semibold transition-colors flex items-center gap-1.5"
                   >
-                    <PlusIcon className="w-3.5 h-3.5" />
+                    <Plus className="w-3.5 h-3.5" />
                     <span>Save to Forward Ledger</span>
                   </button>
                 </div>
@@ -782,103 +1001,405 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="p-8 text-center bg-slate-900/40 border border-slate-800/60 rounded-lg space-y-2">
-                <Compass className="w-8 h-8 text-slate-600 mx-auto" />
-                <h4 className="text-sm font-semibold text-slate-300">No Active Phase 3 SSR Trigger on {selectedSymbol}</h4>
-                <p className="text-xs text-slate-400 max-w-md mx-auto">
-                  Price is currently inside its structural range. The institutional engine requires a decisive BSL/SSL sweep followed by an aggressive MSS displacement candle before arming a limit order.
+            ) : selectedAssetStatus?.phase === 'PHASE_2_MSS' ? (
+              <div className="p-5 bg-sky-950/20 border border-sky-500/30 rounded-lg space-y-3 font-mono">
+                <div className="flex items-center justify-between pb-2 border-b border-sky-800/30">
+                  <div className="flex items-center gap-2">
+                    <Zap className="w-4 h-4 text-sky-400" />
+                    <span className="text-sm font-bold text-white">Phase 2: Market Structure Shift (MSS) Active</span>
+                  </div>
+                  <span className="text-xs text-sky-300 px-2 py-0.5 rounded bg-sky-900/40">Direction: {selectedAssetStatus.direction}</span>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed font-sans">
+                  Institutional displacement broke the opposing structural level at <strong className="text-sky-300">${selectedAssetStatus.mssLevel}</strong> with <strong className="text-sky-300">{selectedAssetStatus.displacementRatio}x</strong> average range. Price is now consolidating. The limit entry will arm automatically when price retraces into the FVG Proximal edge.
                 </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs">
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Swept HTF Pool:</span>
+                    <strong className="text-white">${selectedAssetStatus.sweptLevel} ({selectedAssetStatus.liquidityPoolType})</strong>
+                  </div>
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Structural Break (MSS):</span>
+                    <strong className="text-sky-400">${selectedAssetStatus.mssLevel}</strong>
+                  </div>
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Invalidation Stop Extreme:</span>
+                    <strong className="text-rose-400">${selectedAssetStatus.sweepExtreme}</strong>
+                  </div>
+                </div>
+              </div>
+            ) : selectedAssetStatus?.phase === 'PHASE_1_SWEEP' ? (
+              <div className="p-5 bg-purple-950/20 border border-purple-500/30 rounded-lg space-y-3 font-mono">
+                <div className="flex items-center justify-between pb-2 border-b border-purple-800/30">
+                  <div className="flex items-center gap-2">
+                    <Target className="w-4 h-4 text-purple-400" />
+                    <span className="text-sm font-bold text-white">Phase 1: Liquidity Pool Swept</span>
+                  </div>
+                  <span className="text-xs text-purple-300 px-2 py-0.5 rounded bg-purple-900/40">{selectedAssetStatus.liquidityPoolType} Pool</span>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed font-sans">
+                  Price pierced the prominent {selectedAssetStatus.liquidityPoolType} liquidity pool at <strong className="text-purple-300">${selectedAssetStatus.sweptLevel}</strong> and formed a decisive rejection wick back inside at <strong className="text-purple-300">${selectedAssetStatus.sweepExtreme}</strong>. The SMC engine is monitoring 5m bars for institutional MSS displacement to trigger Phase 2.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs">
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Swept Pool Level:</span>
+                    <strong className="text-white">${selectedAssetStatus.sweptLevel}</strong>
+                  </div>
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Rejection Extreme Wick:</span>
+                    <strong className="text-purple-400">${selectedAssetStatus.sweepExtreme}</strong>
+                  </div>
+                  <div className="p-2.5 rounded bg-slate-900/80 border border-slate-800">
+                    <span className="text-[10px] text-slate-400 block">Pending Confirmation:</span>
+                    <strong className="text-amber-400">MSS Displacement Bar</strong>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-lg space-y-3 font-mono">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                  <div className="flex items-center gap-2">
+                    <Compass className="w-4 h-4 text-slate-400" />
+                    <span className="text-sm font-semibold text-slate-200">{selectedSymbol} Structural Surveillance</span>
+                  </div>
+                  <span className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    Auto-Scanning 20 Binance markets in background · Next tick in {countdown}s
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 leading-relaxed font-sans">
+                  Price is currently inside its structural trading range between higher-timeframe swing points. The institutional engine requires a decisive BSL/SSL liquidity sweep with a rejection wick before executing the 3-phase sequence.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 text-xs">
+                  <div className="p-2.5 rounded bg-slate-950/60 border border-slate-800 flex items-center justify-between">
+                    <div>
+                      <span className="text-[10px] text-slate-500 block">Overhead Buy-Side Liquidity (BSL):</span>
+                      <strong className="text-slate-200 text-sm font-bold">
+                        {selectedAssetStatus?.nearestBsl ? `$${selectedAssetStatus.nearestBsl.toLocaleString()}` : 'Surveilling...'}
+                      </strong>
+                    </div>
+                    {typeof selectedAssetStatus?.distToBslPct === 'number' && (
+                      <span className="text-rose-400 font-bold text-xs">+{selectedAssetStatus.distToBslPct}% away</span>
+                    )}
+                  </div>
+                  <div className="p-2.5 rounded bg-slate-950/60 border border-slate-800 flex items-center justify-between">
+                    <div>
+                      <span className="text-[10px] text-slate-500 block">Below Sell-Side Liquidity (SSL):</span>
+                      <strong className="text-slate-200 text-sm font-bold">
+                        {selectedAssetStatus?.nearestSsl ? `$${selectedAssetStatus.nearestSsl.toLocaleString()}` : 'Surveilling...'}
+                      </strong>
+                    </div>
+                    {typeof selectedAssetStatus?.distToSslPct === 'number' && (
+                      <span className="text-emerald-400 font-bold text-xs">-{selectedAssetStatus.distToSslPct}% away</span>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
           </div>
 
           {/* Multi-Asset Live Scanner Table */}
-          <div className="bg-[#111827] border border-slate-800 rounded-xl p-5 space-y-3">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+          <div className="bg-[#111827] border border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
               <div>
                 <h3 className="text-sm font-bold text-white flex items-center gap-2">
                   <Activity className="w-4 h-4 text-indigo-400" />
-                  <span>Binance Spot/Futures Multi-Coin SSR Scanner</span>
+                  <span>Binance Spot/Futures Multi-Coin SSR Scanner (All Assets)</span>
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Real-time detection of institutional order flow setups across top high-volume pairs.
+                  Continuous automated background surveillance across top high-volume pairs. Tracks Phase 1 sweeps, Phase 2 displacement, and Phase 3 FVG triggers.
                 </p>
               </div>
-              <span className="text-xs font-mono text-slate-400">
-                {scannerSignals.length} Active Candidates
-              </span>
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-mono text-slate-400">
+                  {allAssetStatuses.length} Pairs Monitored
+                </span>
+                {lastScanTime && (
+                  <span className="text-[10px] font-mono text-slate-500">
+                    Updated: {new Date(lastScanTime).toLocaleTimeString()}
+                  </span>
+                )}
+              </div>
             </div>
 
-            {scannerSignals.length > 0 ? (
+            {/* Quick Filter Tabs & Search Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('ALL')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    filterPhase === 'ALL'
+                      ? 'bg-indigo-600 text-white font-bold'
+                      : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                  }`}
+                >
+                  All ({allAssetStatuses.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('ACTIVE_SETUPS')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    filterPhase === 'ACTIVE_SETUPS'
+                      ? 'bg-amber-600 text-white font-bold'
+                      : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                  }`}
+                >
+                  Active Setups ({allAssetStatuses.filter((s) => s.phase !== 'INSIDE_RANGE').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('PHASE_3_FVG_RETURN')}
+                  className={`px-2.5 py-1 rounded transition-colors flex items-center gap-1.5 ${
+                    filterPhase === 'PHASE_3_FVG_RETURN'
+                      ? 'bg-emerald-600 text-white font-bold'
+                      : 'bg-slate-900 text-emerald-400 hover:text-emerald-300 border border-slate-800'
+                  }`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  Phase 3 ({allAssetStatuses.filter((s) => s.phase === 'PHASE_3_FVG_RETURN').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('PHASE_2_MSS')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    filterPhase === 'PHASE_2_MSS'
+                      ? 'bg-sky-600 text-white font-bold'
+                      : 'bg-slate-900 text-sky-400 hover:text-sky-300 border border-slate-800'
+                  }`}
+                >
+                  Phase 2 MSS ({allAssetStatuses.filter((s) => s.phase === 'PHASE_2_MSS').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('PHASE_1_SWEEP')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    filterPhase === 'PHASE_1_SWEEP'
+                      ? 'bg-purple-600 text-white font-bold'
+                      : 'bg-slate-900 text-purple-400 hover:text-purple-300 border border-slate-800'
+                  }`}
+                >
+                  Phase 1 Sweep ({allAssetStatuses.filter((s) => s.phase === 'PHASE_1_SWEEP').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterPhase('INSIDE_RANGE')}
+                  className={`px-2.5 py-1 rounded transition-colors ${
+                    filterPhase === 'INSIDE_RANGE'
+                      ? 'bg-slate-700 text-white font-bold'
+                      : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                  }`}
+                >
+                  Inside Range ({allAssetStatuses.filter((s) => s.phase === 'INSIDE_RANGE').length})
+                </button>
+              </div>
+
+              {/* Symbol Search Input */}
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  placeholder="Filter coins (BTC, SOL, DOGE)..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-8 pr-3 py-1 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500 w-56"
+                />
+              </div>
+            </div>
+
+            {/* Matrix Table */}
+            {allAssetStatuses.length > 0 ? (
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs font-mono">
                   <thead className="bg-slate-900 text-slate-400 border-b border-slate-800 uppercase text-[10px]">
                     <tr>
-                      <th className="py-2.5 px-3">Asset</th>
-                      <th className="py-2.5 px-3">Direction</th>
+                      <th className="py-2.5 px-3">Asset & 24h Vol</th>
+                      <th className="py-2.5 px-3">Price</th>
                       <th className="py-2.5 px-3">Phase Status</th>
-                      <th className="py-2.5 px-3">Swept Pool</th>
+                      <th className="py-2.5 px-3">Direction</th>
+                      <th className="py-2.5 px-3">Swept Pool / Range</th>
+                      <th className="py-2.5 px-3">MSS / Structural Shift</th>
                       <th className="py-2.5 px-3">Limit Entry (FVG)</th>
                       <th className="py-2.5 px-3">Stop Loss</th>
-                      <th className="py-2.5 px-3">Target TP1</th>
-                      <th className="py-2.5 px-3">Confidence</th>
+                      <th className="py-2.5 px-3">Quality / Tier</th>
                       <th className="py-2.5 px-3 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 tabular-nums">
-                    {scannerSignals.map((sig) => (
-                      <tr key={sig.id} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-3 px-3 font-bold text-white flex items-center gap-1.5">
-                          <span>{sig.symbol}</span>
-                        </td>
-                        <td className="py-3 px-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            sig.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
-                          }`}>
-                            {sig.direction}
-                          </span>
-                        </td>
-                        <td className="py-3 px-3 text-slate-300">
-                          <span className="text-indigo-400 font-semibold">{sig.phase.replace(/_/g, ' ')}</span>
-                        </td>
-                        <td className="py-3 px-3 text-slate-300">
-                          ${sig.sweptLevel.toLocaleString()} ({sig.liquidityPoolType})
-                        </td>
-                        <td className="py-3 px-3 font-bold text-sky-400">
-                          ${sig.entryPrice.toLocaleString()}
-                        </td>
-                        <td className="py-3 px-3 font-bold text-rose-400">
-                          ${sig.stopLoss.toLocaleString()}
-                        </td>
-                        <td className="py-3 px-3 font-bold text-emerald-400">
-                          ${sig.tp1.toLocaleString()}
-                        </td>
-                        <td className="py-3 px-3">
-                          <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-bold text-[10px]">
-                            {sig.confidenceScore}% (Tier {sig.confidenceTier})
-                          </span>
-                        </td>
-                        <td className="py-3 px-3 text-right">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              onSelectSymbol(sig.symbol);
-                              persistSignal(sig);
-                            }}
-                            className="px-2.5 py-1 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/40 text-indigo-200 rounded text-[11px] font-sans font-medium transition-colors"
-                          >
-                            Inspect & Trade
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {allAssetStatuses
+                      .filter((st) => {
+                        if (searchQuery.trim()) {
+                          const q = searchQuery.trim().toUpperCase();
+                          if (!st.symbol.toUpperCase().includes(q)) return false;
+                        }
+                        if (filterPhase === 'ALL') return true;
+                        if (filterPhase === 'ACTIVE_SETUPS') {
+                          return st.phase !== 'INSIDE_RANGE';
+                        }
+                        return st.phase === filterPhase;
+                      })
+                      .map((st) => (
+                        <tr
+                          key={st.symbol}
+                          className={`hover:bg-slate-800/40 transition-colors ${
+                            st.symbol === selectedSymbol ? 'bg-indigo-950/20' : ''
+                          } ${
+                            st.phase === 'PHASE_3_FVG_RETURN' ? 'bg-emerald-950/10' : ''
+                          }`}
+                        >
+                          <td className="py-3 px-3 font-bold text-white">
+                            <div className="flex items-center gap-1.5">
+                              <span>{st.symbol}</span>
+                              {st.symbol === selectedSymbol && (
+                                <span className="px-1.5 py-0.2 bg-indigo-500/20 text-indigo-400 rounded text-[9px] font-sans">
+                                  Active
+                                </span>
+                              )}
+                            </div>
+                            {typeof st.quoteVolume24h === 'number' && st.quoteVolume24h > 0 && (
+                              <span className="text-[10px] text-slate-500 block font-normal font-sans">
+                                ${(st.quoteVolume24h / 1_000_000).toFixed(1)}M 24h vol
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            <span className="font-bold text-slate-200">
+                              ${st.currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
+                            </span>
+                            {typeof st.priceChangePercent24h === 'number' && (
+                              <span className={`block text-[10px] font-semibold ${
+                                st.priceChangePercent24h >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                              }`}>
+                                {st.priceChangePercent24h >= 0 ? '+' : ''}{st.priceChangePercent24h.toFixed(2)}%
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            {st.phase === 'PHASE_3_FVG_RETURN' ? (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5 w-fit">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                                Phase 3: FVG Retrace
+                              </span>
+                            ) : st.phase === 'PHASE_2_MSS' ? (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 text-sky-400 border border-sky-500/30 flex items-center gap-1.5 w-fit">
+                                <span className="w-1.5 h-1.5 rounded-full bg-sky-400"></span>
+                                Phase 2: MSS Shift
+                              </span>
+                            ) : st.phase === 'PHASE_1_SWEEP' ? (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-500/20 text-purple-400 border border-purple-500/30 flex items-center gap-1.5 w-fit">
+                                <span className="w-1.5 h-1.5 rounded-full bg-purple-400"></span>
+                                Phase 1: Swept
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400 border border-slate-700/60 flex items-center gap-1.5 w-fit">
+                                <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+                                Inside Range
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            {st.direction ? (
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                st.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'
+                              }`}>
+                                {st.direction === 'LONG' ? '↑ LONG' : '↓ SHORT'}
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 text-[11px]">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-slate-300">
+                            {st.sweptLevel ? (
+                              <div>
+                                <span className="text-slate-200 font-bold">${st.sweptLevel.toLocaleString()}</span>
+                                <span className="text-[10px] text-slate-400 block font-sans">({st.liquidityPoolType} Pool)</span>
+                              </div>
+                            ) : st.nearestBsl && st.nearestSsl ? (
+                              <div className="text-[10px] text-slate-400 space-y-0.5">
+                                <div>BSL: <span className="text-rose-400 font-semibold">${st.nearestBsl.toLocaleString()}</span></div>
+                                <div>SSL: <span className="text-emerald-400 font-semibold">${st.nearestSsl.toLocaleString()}</span></div>
+                              </div>
+                            ) : (
+                              <span className="text-slate-500 text-[11px]">Monitoring</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-slate-300">
+                            {st.mssLevel ? (
+                              <div>
+                                <span className="text-sky-300 font-bold">${st.mssLevel.toLocaleString()}</span>
+                                {typeof st.displacementRatio === 'number' && (
+                                  <span className="text-[10px] text-slate-400 block font-sans">({st.displacementRatio}x vol)</span>
+                                )}
+                              </div>
+                            ) : st.distToBslPct !== undefined ? (
+                              <span className="text-[11px] text-slate-400">
+                                +{st.distToBslPct}% / -{st.distToSslPct}%
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 text-[11px]">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 font-bold">
+                            {st.entryPrice ? (
+                              <span className="text-sky-400">${st.entryPrice.toLocaleString()}</span>
+                            ) : st.fvgProximal ? (
+                              <span className="text-sky-300/80">${st.fvgProximal.toLocaleString()}</span>
+                            ) : (
+                              <span className="text-slate-500 font-normal">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 font-bold">
+                            {st.stopLoss ? (
+                              <span className="text-rose-400">${st.stopLoss.toLocaleString()}</span>
+                            ) : st.sweepExtreme ? (
+                              <span className="text-rose-300/80">${st.sweepExtreme.toLocaleString()}</span>
+                            ) : (
+                              <span className="text-slate-500 font-normal">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            {st.confidenceTier ? (
+                              <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-bold text-[10px]">
+                                {st.confidenceScore}% (Tier {st.confidenceTier})
+                              </span>
+                            ) : st.phase === 'PHASE_2_MSS' ? (
+                              <span className="px-1.5 py-0.5 rounded bg-sky-950/60 text-sky-400 text-[10px]">
+                                Displaced
+                              </span>
+                            ) : st.phase === 'PHASE_1_SWEEP' ? (
+                              <span className="px-1.5 py-0.5 rounded bg-purple-950/60 text-purple-400 text-[10px]">
+                                Swept
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 text-[10px]">Surveillance</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onSelectSymbol(st.symbol);
+                                if (st.signal) persistSignal(st.signal);
+                                window.scrollTo({ top: 0, behavior: 'smooth' });
+                              }}
+                              className={`px-2.5 py-1 rounded text-[11px] font-sans font-medium transition-colors ${
+                                st.symbol === selectedSymbol
+                                  ? 'bg-slate-800 text-slate-400 border border-slate-700'
+                                  : 'bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/40 text-indigo-200'
+                              }`}
+                            >
+                              {st.symbol === selectedSymbol ? 'Active View' : 'Inspect & Trade'}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
                   </tbody>
                 </table>
               </div>
             ) : (
-              <div className="py-8 text-center text-xs text-slate-500">
-                <span>No pairs currently triggering active FVG return touches. Click &quot;Rescan Markets&quot; to refresh.</span>
+              <div className="py-10 text-center text-xs text-slate-500 space-y-2">
+                <RotateCcw className="w-5 h-5 text-indigo-400 animate-spin mx-auto" />
+                <p>Loading multi-asset Binance order flow scanner...</p>
               </div>
             )}
           </div>

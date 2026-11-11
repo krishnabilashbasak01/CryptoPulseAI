@@ -20,7 +20,7 @@ import { Candle } from './quant';
 // ============================================================================
 
 export type SsrDirection = 'LONG' | 'SHORT';
-export type SsrPhase = 'PHASE_1_SWEEP' | 'PHASE_2_MSS' | 'PHASE_3_FVG_RETURN' | 'COMPLETED_TRIGGER';
+export type SsrPhase = 'PHASE_1_SWEEP' | 'PHASE_2_MSS' | 'PHASE_3_FVG_RETURN' | 'COMPLETED_TRIGGER' | 'INSIDE_RANGE';
 
 export interface LiquidityPool {
   id: string;
@@ -102,6 +102,54 @@ export interface SsrSignal {
   exitPrice?: number;
   exitTime?: number;
   exitReason?: string;
+}
+
+export interface SsrAssetScanResult {
+  symbol: string;
+  phase: SsrPhase;
+  phaseLabel: string;
+  direction?: SsrDirection;
+  currentPrice: number;
+  priceChangePercent24h?: number;
+  quoteVolume24h?: number;
+  
+  // Phase 1 info
+  liquidityPoolType?: 'BSL' | 'SSL';
+  sweptLevel?: number;
+  sweepExtreme?: number;
+  sweepTime?: number;
+  sweepTimeString?: string;
+  sweepBarsAgo?: number;
+
+  // Phase 2 info
+  mssLevel?: number;
+  displacementRatio?: number;
+  mssTime?: number;
+
+  // Phase 3 info
+  fvgProximal?: number;
+  fvgDistal?: number;
+  fvgSizePercent?: number;
+  entryPrice?: number;
+  stopLoss?: number;
+  tp1?: number;
+  tp2?: number;
+  tp3?: number;
+  riskPercent?: number;
+  confidenceScore?: number;
+  confidenceTier?: 'A+' | 'A' | 'B+';
+
+  // Inside Range context
+  nearestBsl?: number;
+  distToBslPct?: number;
+  nearestSsl?: number;
+  distToSslPct?: number;
+
+  // Full signal if in Phase 3
+  signal?: SsrSignal;
+
+  statusMessage: string;
+  lastUpdated: number;
 }
 
 export interface SsrBacktestTrade {
@@ -593,6 +641,152 @@ export function findLiveSsrSignal(
     status: 'ACTIVE',
     currentPrice: currentBar.close,
     pnlPercent: 0.0,
+  };
+}
+
+/**
+ * Scans an individual asset across all 3 SSR phases:
+ * - Phase 3: FVG Proximal Retracement (Ready for execution)
+ * - Phase 2: MSS Displacement (Displacement confirmed, awaiting retracement)
+ * - Phase 1: Liquidity Swept (BSL/SSL swept with rejection wick, awaiting MSS)
+ * - Inside Range: Monitoring distance to nearest BSL and SSL pools
+ */
+export function scanSsrAssetStatus(
+  candlesHTF: Candle[],
+  candlesLTF: Candle[],
+  symbol: string,
+  riskUsdt = 100
+): SsrAssetScanResult {
+  const now = Date.now();
+  if (candlesHTF.length < 10 || candlesLTF.length < 10) {
+    const fallbackPrice = candlesLTF.length > 0 ? candlesLTF[candlesLTF.length - 1].close : 0;
+    return {
+      symbol,
+      phase: 'INSIDE_RANGE',
+      phaseLabel: 'Insufficient Candles',
+      currentPrice: fallbackPrice,
+      statusMessage: 'Accumulating price bars...',
+      lastUpdated: now,
+    };
+  }
+
+  const currentBar = candlesLTF[candlesLTF.length - 1];
+  const currentPrice = currentBar.close;
+  const currentTime = currentBar.time;
+
+  // Extract HTF Liquidity Pools
+  const pools = extractLiquidityPools(candlesHTF, 3);
+  const bslPools = pools.filter((p) => p.type === 'BSL').sort((a, b) => a.price - b.price);
+  const sslPools = pools.filter((p) => p.type === 'SSL').sort((a, b) => b.price - a.price);
+
+  const nearestBsl = bslPools.find((p) => p.price >= currentPrice) || bslPools[bslPools.length - 1];
+  const nearestSsl = sslPools.find((p) => p.price <= currentPrice) || sslPools[0];
+
+  const distToBslPct = nearestBsl ? Number((((nearestBsl.price - currentPrice) / currentPrice) * 100).toFixed(2)) : undefined;
+  const distToSslPct = nearestSsl ? Number((((currentPrice - nearestSsl.price) / currentPrice) * 100).toFixed(2)) : undefined;
+
+  // 1. First check if a live Phase 3 trigger exists
+  const liveSignal = findLiveSsrSignal(candlesHTF, candlesLTF, symbol, riskUsdt);
+  if (liveSignal) {
+    return {
+      symbol,
+      phase: 'PHASE_3_FVG_RETURN',
+      phaseLabel: 'Phase 3: FVG Retracement Entry',
+      direction: liveSignal.direction,
+      currentPrice,
+      liquidityPoolType: liveSignal.liquidityPoolType,
+      sweptLevel: liveSignal.sweptLevel,
+      sweepExtreme: liveSignal.sweepExtreme,
+      mssLevel: liveSignal.mssLevel,
+      displacementRatio: liveSignal.displacementScore,
+      fvgProximal: liveSignal.fvgProximal,
+      fvgDistal: liveSignal.fvgDistal,
+      fvgSizePercent: liveSignal.fvgSizePercent,
+      entryPrice: liveSignal.entryPrice,
+      stopLoss: liveSignal.stopLoss,
+      tp1: liveSignal.tp1,
+      tp2: liveSignal.tp2,
+      tp3: liveSignal.tp3,
+      riskPercent: liveSignal.riskPercent,
+      confidenceScore: liveSignal.confidenceScore,
+      confidenceTier: liveSignal.confidenceTier,
+      signal: liveSignal,
+      statusMessage: `Phase 3 Active Limit Trigger: Proximal FVG at $${liveSignal.entryPrice.toLocaleString()}, SL at $${liveSignal.stopLoss.toLocaleString()} (${liveSignal.riskPercent}% risk).`,
+      lastUpdated: now,
+    };
+  }
+
+  // 2. Check for recent sweep (last 16 bars)
+  const startSlice = Math.max(0, candlesLTF.length - 16);
+  const sweep = checkLiquiditySweep(candlesLTF.slice(startSlice), pools, currentTime);
+
+  if (!sweep) {
+    let msg = 'Inside structural range. Monitoring nearest liquidity pools.';
+    if (nearestBsl && nearestSsl) {
+      msg = `Inside Range: BSL overhead at $${nearestBsl.price.toLocaleString()} (+${distToBslPct}%), SSL below at $${nearestSsl.price.toLocaleString()} (-${distToSslPct}%)`;
+    }
+    return {
+      symbol,
+      phase: 'INSIDE_RANGE',
+      phaseLabel: 'Inside Range',
+      currentPrice,
+      nearestBsl: nearestBsl?.price,
+      distToBslPct,
+      nearestSsl: nearestSsl?.price,
+      distToSslPct,
+      statusMessage: msg,
+      lastUpdated: now,
+    };
+  }
+
+  const { sweptPool, direction, sweepExtreme, sweepBarIdx } = sweep;
+  const absSweepBarIdx = startSlice + sweepBarIdx;
+  const sweepBarsAgo = Math.max(0, candlesLTF.length - 1 - absSweepBarIdx);
+
+  // 3. Check for MSS displacement
+  const mss = detectMarketStructureShift(candlesLTF, absSweepBarIdx, direction, 14);
+
+  if (!mss) {
+    return {
+      symbol,
+      phase: 'PHASE_1_SWEEP',
+      phaseLabel: 'Phase 1: Liquidity Swept',
+      direction,
+      currentPrice,
+      liquidityPoolType: sweptPool.type,
+      sweptLevel: sweptPool.price,
+      sweepExtreme: formatSsrPrice(sweepExtreme),
+      sweepTime: candlesLTF[absSweepBarIdx].time,
+      sweepTimeString: formatSsrTime(candlesLTF[absSweepBarIdx].time),
+      sweepBarsAgo,
+      statusMessage: `Phase 1 Confirmed: ${sweptPool.type} pool swept at $${sweptPool.price.toLocaleString()} with rejection wick. Monitoring for aggressive MSS displacement.`,
+      lastUpdated: now,
+    };
+  }
+
+  // 4. MSS confirmed -> Phase 2 (checking for FVG presence)
+  const fvg = detectFairValueGap(candlesLTF, absSweepBarIdx, mss.displacementBarIdx, direction);
+
+  return {
+    symbol,
+    phase: 'PHASE_2_MSS',
+    phaseLabel: 'Phase 2: MSS Displacement',
+    direction,
+    currentPrice,
+    liquidityPoolType: sweptPool.type,
+    sweptLevel: sweptPool.price,
+    sweepExtreme: formatSsrPrice(sweepExtreme),
+    sweepBarsAgo,
+    mssLevel: formatSsrPrice(mss.brokenStructuralLevel),
+    displacementRatio: mss.displacementRatio,
+    mssTime: mss.time,
+    fvgProximal: fvg ? fvg.proximalEdge : undefined,
+    fvgDistal: fvg ? fvg.distalEdge : undefined,
+    fvgSizePercent: fvg ? fvg.gapSizePercent : undefined,
+    statusMessage: fvg 
+      ? `Phase 2 Confirmed: MSS displacement broke structural level at $${formatSsrPrice(mss.brokenStructuralLevel)}. FVG formed ($${fvg.proximalEdge}). Awaiting limit touch.`
+      : `Phase 2 Confirmed: MSS displacement broke structural level at $${formatSsrPrice(mss.brokenStructuralLevel)} (${mss.displacementRatio}x vol). Awaiting clean FVG imbalance.`,
+    lastUpdated: now,
   };
 }
 

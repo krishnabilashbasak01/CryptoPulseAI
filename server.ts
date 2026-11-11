@@ -24,9 +24,11 @@ import {
 import {
   runSsrBacktest,
   findLiveSsrSignal,
+  scanSsrAssetStatus,
   calculateSsrPositionSize,
   type SsrBacktestSummary,
   type SsrSignal,
+  type SsrAssetScanResult,
 } from './src/utils/ssrStrategy.ts';
 
 dotenv.config();
@@ -1082,50 +1084,111 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
     }
   });
 
+  // In-memory short-lived cache for multi-asset SSR scanner
+  let ssrScanCache: { timestamp: number; key: string; payload: any } | null = null;
+
   // 8. Sweep, Shift, and Return (SSR) Multi-Asset Live Scanner
-  app.get('/api/ssr/scan', async (_req, res) => {
+  app.get('/api/ssr/scan', async (req, res) => {
     try {
-      const symbolsToScan = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'XRPUSDT', 'NEARUSDT', 'AVAXUSDT', 'SUIUSDT'];
-      const results: any[] = [];
+      const rawSymbols = typeof req.query.symbols === 'string' ? req.query.symbols : '';
+      const activeSymbol = typeof req.query.activeSymbol === 'string' ? req.query.activeSymbol.toUpperCase() : '';
+      const forceRefresh = req.query.force === 'true';
 
-      await Promise.all(
-        symbolsToScan.map(async (sym) => {
-          try {
-            const [rawHTF, rawLTF] = await Promise.all([
-              fetchFromBinance(`/klines?symbol=${sym}&interval=1h&limit=80`),
-              fetchFromBinance(`/klines?symbol=${sym}&interval=5m&limit=80`),
-            ]);
+      let symbolsToScan: string[] = CURATED_HIGH_VOL_SYMBOLS;
+      if (rawSymbols) {
+        const parsed = rawSymbols.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+        if (parsed.length > 0) symbolsToScan = parsed;
+      }
 
-            const mapK = (k: any) => ({
-              time: Number(k[0]),
-              open: parseFloat(k[1]),
-              high: parseFloat(k[2]),
-              low: parseFloat(k[3]),
-              close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-              quoteVolume: parseFloat(k[7] || k[5] || '0'),
-            });
+      if (activeSymbol && !symbolsToScan.includes(activeSymbol)) {
+        symbolsToScan = [activeSymbol, ...symbolsToScan];
+      }
 
-            const candlesHTF = Array.isArray(rawHTF) ? rawHTF.map(mapK) : [];
-            const candlesLTF = Array.isArray(rawLTF) ? rawLTF.map(mapK) : [];
+      // Limit to 25 symbols to protect network throughput
+      symbolsToScan = Array.from(new Set(symbolsToScan)).slice(0, 25);
+      const cacheKey = symbolsToScan.join(',');
 
-            const signal = findLiveSsrSignal(candlesHTF, candlesLTF, sym, 100);
-            if (signal) {
-              results.push(signal);
+      // Serve from short-lived 5-second cache if available and not forced
+      if (!forceRefresh && ssrScanCache && ssrScanCache.key === cacheKey && Date.now() - ssrScanCache.timestamp < 5000) {
+        return res.json(ssrScanCache.payload);
+      }
+
+      const mapK = (k: any) => ({
+        time: Number(k[0]),
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+        quoteVolume: parseFloat(k[7] || k[5] || '0'),
+      });
+
+      const assetStatuses: SsrAssetScanResult[] = [];
+      const signals: SsrSignal[] = [];
+
+      // Fetch in chunks of 5 to avoid Binance burst limits
+      const chunkSize = 5;
+      for (let i = 0; i < symbolsToScan.length; i += chunkSize) {
+        const chunk = symbolsToScan.slice(i, i + chunkSize);
+        await Promise.all(
+          chunk.map(async (sym) => {
+            try {
+              const [rawHTF, rawLTF] = await Promise.all([
+                fetchFromBinance(`/klines?symbol=${sym}&interval=1h&limit=60`),
+                fetchFromBinance(`/klines?symbol=${sym}&interval=5m&limit=60`),
+              ]);
+
+              const candlesHTF = Array.isArray(rawHTF) ? rawHTF.map(mapK) : [];
+              const candlesLTF = Array.isArray(rawLTF) ? rawLTF.map(mapK) : [];
+
+              const status = scanSsrAssetStatus(candlesHTF, candlesLTF, sym, 100);
+              assetStatuses.push(status);
+              if (status.phase === 'PHASE_3_FVG_RETURN' && status.signal) {
+                signals.push(status.signal);
+              }
+            } catch {
+              const fallbackSeed = FALLBACK_BASE_ASSETS[sym];
+              const fbPrice = fallbackSeed ? fallbackSeed.price : 0;
+              assetStatuses.push({
+                symbol: sym,
+                phase: 'INSIDE_RANGE',
+                phaseLabel: 'Inside Range',
+                currentPrice: fbPrice,
+                statusMessage: 'Live Binance feed connecting...',
+                lastUpdated: Date.now(),
+              });
             }
-          } catch {
-            // ignore individual coin scan errors
-          }
-        })
-      );
+          })
+        );
+      }
 
-      res.json({
+      // Priority sort: Phase 3 -> Phase 2 -> Phase 1 -> Inside Range
+      const phaseOrder: Record<string, number> = {
+        PHASE_3_FVG_RETURN: 0,
+        PHASE_2_MSS: 1,
+        PHASE_1_SWEEP: 2,
+        INSIDE_RANGE: 3,
+      };
+      assetStatuses.sort((a, b) => (phaseOrder[a.phase] ?? 9) - (phaseOrder[b.phase] ?? 9));
+
+      const payload = {
         success: true,
         timestamp: new Date().toISOString(),
-        scannedCount: symbolsToScan.length,
-        signalCount: results.length,
-        signals: results,
-      });
+        scannedCount: assetStatuses.length,
+        signalCount: signals.length,
+        signals,
+        assetStatuses,
+        counts: {
+          total: assetStatuses.length,
+          phase3: assetStatuses.filter((s) => s.phase === 'PHASE_3_FVG_RETURN').length,
+          phase2: assetStatuses.filter((s) => s.phase === 'PHASE_2_MSS').length,
+          phase1: assetStatuses.filter((s) => s.phase === 'PHASE_1_SWEEP').length,
+          insideRange: assetStatuses.filter((s) => s.phase === 'INSIDE_RANGE').length,
+        },
+      };
+
+      ssrScanCache = { timestamp: Date.now(), key: cacheKey, payload };
+      res.json(payload);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'SSR live scan failed' });
     }
