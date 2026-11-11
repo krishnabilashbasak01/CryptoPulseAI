@@ -578,29 +578,33 @@ export function findLiveSsrSignal(
   const fvg = detectFairValueGap(candlesLTF, absSweepBarIdx, mss.displacementBarIdx, direction);
   if (!fvg) return null;
 
-  // Entry at FVG Proximal Edge
-  const entryPrice = fvg.proximalEdge;
-  const spreadBuffer = Math.max(Math.abs(currentBar.high - currentBar.low) * 0.15, entryPrice * 0.0006);
+  // Consequent Encroachment (30% depth into FVG for institutional fill price)
+  const entryPrice = formatSsrPrice(
+    direction === 'LONG'
+      ? fvg.proximalEdge - (fvg.proximalEdge - fvg.distalEdge) * 0.30
+      : fvg.proximalEdge + (fvg.distalEdge - fvg.proximalEdge) * 0.30
+  );
 
-  // Invalidation: Strict Stop Loss at Sweep Extreme Wick
-  const stopLoss = direction === 'SHORT' ? sweepExtreme + spreadBuffer : sweepExtreme - spreadBuffer;
+  // Invalidation: Stop Loss with 0.30% structural buffer to prevent secondary sweep liquidations
+  const spreadBuffer = Math.max(Math.abs(currentBar.high - currentBar.low) * 0.8, entryPrice * 0.0030);
+  const stopLoss = formatSsrPrice(direction === 'SHORT' ? sweepExtreme + spreadBuffer : sweepExtreme - spreadBuffer);
   const riskAmount = Math.abs(entryPrice - stopLoss);
   if (riskAmount <= 0) return null;
   const riskPercent = Number(((riskAmount / entryPrice) * 100).toFixed(2));
 
-  // Risk cap: Maximum 3.5% stop distance on crypto futures
-  if (riskPercent > 3.8 || riskPercent < 0.1) return null;
+  // Risk cap: Maximum 4.0% stop distance on crypto futures
+  if (riskPercent > 4.0 || riskPercent < 0.1) return null;
 
-  // Tiered Exits: 1:2 (50% + BE), 1:3 (25%), 1:4 (25%)
-  const tp1 = formatSsrPrice(direction === 'LONG' ? entryPrice + 2.0 * riskAmount : entryPrice - 2.0 * riskAmount);
-  const tp2 = formatSsrPrice(direction === 'LONG' ? entryPrice + 3.0 * riskAmount : entryPrice - 3.0 * riskAmount);
-  const tp3 = formatSsrPrice(direction === 'LONG' ? entryPrice + 4.0 * riskAmount : entryPrice - 4.0 * riskAmount);
+  // High-Expectancy Tiered Exits: 1:1.3 (50% + BE lock), 1:2.2 (25% + trail to TP1), 1:3.5 (25% runner)
+  const tp1 = formatSsrPrice(direction === 'LONG' ? entryPrice + 1.3 * riskAmount : entryPrice - 1.3 * riskAmount);
+  const tp2 = formatSsrPrice(direction === 'LONG' ? entryPrice + 2.2 * riskAmount : entryPrice - 2.2 * riskAmount);
+  const tp3 = formatSsrPrice(direction === 'LONG' ? entryPrice + 3.5 * riskAmount : entryPrice - 3.5 * riskAmount);
 
   // Score evaluation
-  let confidenceScore = 80;
-  if (mss.displacementRatio >= 1.5) confidenceScore += 8;
-  if (fvg.gapSizePercent >= 0.1) confidenceScore += 6;
-  if (riskPercent <= 1.5) confidenceScore += 4;
+  let confidenceScore = 82;
+  if (mss.displacementRatio >= 1.35) confidenceScore += 8;
+  if (fvg.gapSizePercent >= 0.08) confidenceScore += 5;
+  if (riskPercent <= 2.0) confidenceScore += 4;
   confidenceScore = Math.min(99, confidenceScore);
 
   const confidenceTier: 'A+' | 'A' | 'B+' = confidenceScore >= 90 ? 'A+' : confidenceScore >= 80 ? 'A' : 'B+';
@@ -807,6 +811,14 @@ export interface SsrBacktestOptions {
   accountEquityUsdt?: number;
   maxHoldBars?: number;
   takerFeeRate?: number; // default 0.05% (0.0005)
+  // Institutional SMC Engine Parameters
+  htfTrendFilter?: boolean;
+  fvgEntryDepth?: number;
+  slBufferPct?: number;
+  tp1R?: number;
+  tp2R?: number;
+  tp3R?: number;
+  minDisplacement?: number;
 }
 
 /**
@@ -825,8 +837,15 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
     dateRangePreset = '7d',
     riskPerTradeUsdt = 100,
     accountEquityUsdt = 10000,
-    maxHoldBars = 72,
+    maxHoldBars = 96,
     takerFeeRate = 0.0005,
+    htfTrendFilter = true,
+    fvgEntryDepth = 0.30,
+    slBufferPct = 0.0030,
+    tp1R = 1.3,
+    tp2R = 2.2,
+    tp3R = 3.5,
+    minDisplacement = 1.18,
   } = options;
 
   const barMinutes = timeframeLTF === '1m' ? 1 : timeframeLTF === '3m' ? 3 : 5;
@@ -845,10 +864,30 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
     CHOPPY_TIME_EXPIRATION: 0,
   };
 
+  // Helper: Determine Higher-Timeframe Trend Bias at any given timestamp
+  function getHtfTrendAt(time: number): 'BULLISH' | 'BEARISH' | 'NEUTRAL' {
+    let htfIdx = -1;
+    for (let k = candlesHTF.length - 1; k >= 0; k--) {
+      if (candlesHTF[k].time <= time) {
+        htfIdx = k;
+        break;
+      }
+    }
+    if (htfIdx < 15) return 'NEUTRAL';
+    const slice = candlesHTF.slice(Math.max(0, htfIdx - 50), htfIdx + 1);
+    const sma20 = slice.slice(-20).reduce((a, b) => a + b.close, 0) / Math.min(20, slice.length);
+    const sma50 = slice.reduce((a, b) => a + b.close, 0) / slice.length;
+    const currPrice = slice[slice.length - 1].close;
+
+    if (sma20 > sma50 && currPrice > sma50) return 'BULLISH';
+    if (sma20 < sma50 && currPrice < sma50) return 'BEARISH';
+    return 'NEUTRAL';
+  }
+
   let activeTrade: {
     trade: SsrBacktestTrade;
     entryBarIdx: number;
-    breakEvenActivated: boolean;
+    stage: 0 | 1 | 2; // 0: initial SL, 1: hit TP1 (BE locked), 2: hit TP2 (trail to TP1)
   } | null = null;
 
   // Track pending limit orders waiting for FVG return
@@ -876,7 +915,7 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
     // A. Manage Active Trade
     // ------------------------------------------------------------------------
     if (activeTrade) {
-      const { trade, entryBarIdx } = activeTrade;
+      const { trade, entryBarIdx, stage } = activeTrade;
       const barsHeld = i - entryBarIdx;
       const durationMinutes = barsHeld * barMinutes;
       const hrs = Math.floor(durationMinutes / 60);
@@ -884,12 +923,20 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
       const durationString = hrs > 0 ? `${hrs}h ${mins}m (${barsHeld} bars)` : `${durationMinutes}m (${barsHeld} bars)`;
       let isClosed = false;
 
-      if (trade.direction === 'LONG') {
-        const effectiveSL = activeTrade.breakEvenActivated
-          ? Math.max(trade.stopLoss, trade.entryPrice)
-          : trade.stopLoss;
+      // Dynamic Institutional Trailing Stop:
+      // Stage 0: Initial SL beyond sweep extreme + 0.30% buffer
+      // Stage 1: Hit TP1 (1.3R) -> SL moved to Breakeven (+0.05R cushion)
+      // Stage 2: Hit TP2 (2.2R) -> SL trailed to TP1 (1.3R)
+      let effectiveSL = trade.stopLoss;
+      if (stage === 1) {
+        effectiveSL = trade.direction === 'LONG'
+          ? trade.entryPrice + 0.05 * trade.riskAmount
+          : trade.entryPrice - 0.05 * trade.riskAmount;
+      } else if (stage >= 2) {
+        effectiveSL = trade.tp1;
+      }
 
-        // Check Stop Loss
+      if (trade.direction === 'LONG') {
         if (currBar.low <= effectiveSL) {
           isClosed = true;
           trade.stoppedOut = true;
@@ -900,16 +947,15 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
           trade.durationMinutes = durationMinutes;
           trade.durationString = durationString;
 
-          if (trade.hitTp2) {
+          if (stage === 2) {
             trade.exitReason = 'TP2_TRAIL_STOP';
-            trade.netRealizedR = 0.5 * 2.0 + 0.25 * 3.0; // 1.75R
-          } else if (trade.hitTp1) {
+            trade.netRealizedR = Number((0.5 * tp1R + 0.25 * tp2R + 0.25 * tp1R).toFixed(2));
+          } else if (stage === 1) {
             trade.exitReason = 'TP1_TRAIL_STOP';
-            trade.netRealizedR = 0.5 * 2.0; // 1.0R
+            trade.netRealizedR = Number((0.5 * tp1R + 0.5 * 0.05).toFixed(2));
           } else {
             trade.exitReason = 'FULL_STOP_LOSS';
             trade.netRealizedR = -1.0;
-            // Classify failure mode
             if (currBar.low < trade.stopLoss * 0.985) {
               failureClassification.TREND_MOMENTUM_RUNAWAY++;
               trade.failureCategory = 'TREND_MOMENTUM_RUNAWAY';
@@ -922,17 +968,18 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
           }
         } else {
           // Check Take-Profit Targets
-          if (!trade.hitTp1 && currBar.high >= trade.tp1) {
+          if (stage === 0 && currBar.high >= trade.tp1) {
             trade.hitTp1 = true;
-            activeTrade.breakEvenActivated = true; // Move Stop to Breakeven
+            activeTrade.stage = 1; // Move Stop to Breakeven (+0.05R)
           }
-          if (trade.hitTp1 && !trade.hitTp2 && currBar.high >= trade.tp2) {
+          if (activeTrade.stage === 1 && currBar.high >= trade.tp2) {
             trade.hitTp2 = true;
+            activeTrade.stage = 2; // Trail Stop to TP1 (1.3R)
           }
-          if (trade.hitTp2 && !trade.hitTp3 && currBar.high >= trade.tp3) {
+          if (activeTrade.stage === 2 && currBar.high >= trade.tp3) {
             trade.hitTp3 = true;
             trade.exitReason = 'TP3_MAX';
-            trade.netRealizedR = 0.5 * 2.0 + 0.25 * 3.0 + 0.25 * 4.0; // 2.75R
+            trade.netRealizedR = Number((0.5 * tp1R + 0.25 * tp2R + 0.25 * tp3R).toFixed(2));
             trade.exitPrice = formatSsrPrice(trade.tp3);
             trade.exitTime = currBar.time;
             trade.exitTimeString = formatSsrTime(currBar.time);
@@ -944,10 +991,6 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
         }
       } else {
         // SHORT Trade
-        const effectiveSL = activeTrade.breakEvenActivated
-          ? Math.min(trade.stopLoss, trade.entryPrice)
-          : trade.stopLoss;
-
         if (currBar.high >= effectiveSL) {
           isClosed = true;
           trade.stoppedOut = true;
@@ -958,12 +1001,12 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
           trade.durationMinutes = durationMinutes;
           trade.durationString = durationString;
 
-          if (trade.hitTp2) {
+          if (stage === 2) {
             trade.exitReason = 'TP2_TRAIL_STOP';
-            trade.netRealizedR = 0.5 * 2.0 + 0.25 * 3.0; // 1.75R
-          } else if (trade.hitTp1) {
+            trade.netRealizedR = Number((0.5 * tp1R + 0.25 * tp2R + 0.25 * tp1R).toFixed(2));
+          } else if (stage === 1) {
             trade.exitReason = 'TP1_TRAIL_STOP';
-            trade.netRealizedR = 0.5 * 2.0; // 1.0R
+            trade.netRealizedR = Number((0.5 * tp1R + 0.5 * 0.05).toFixed(2));
           } else {
             trade.exitReason = 'FULL_STOP_LOSS';
             trade.netRealizedR = -1.0;
@@ -979,17 +1022,18 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
           }
         } else {
           // Check Take-Profit Targets
-          if (!trade.hitTp1 && currBar.low <= trade.tp1) {
+          if (stage === 0 && currBar.low <= trade.tp1) {
             trade.hitTp1 = true;
-            activeTrade.breakEvenActivated = true; // Move Stop to Breakeven
+            activeTrade.stage = 1; // Move Stop to Breakeven (+0.05R)
           }
-          if (trade.hitTp1 && !trade.hitTp2 && currBar.low <= trade.tp2) {
+          if (activeTrade.stage === 1 && currBar.low <= trade.tp2) {
             trade.hitTp2 = true;
+            activeTrade.stage = 2; // Trail Stop to TP1 (1.3R)
           }
-          if (trade.hitTp2 && !trade.hitTp3 && currBar.low <= trade.tp3) {
+          if (activeTrade.stage === 2 && currBar.low <= trade.tp3) {
             trade.hitTp3 = true;
             trade.exitReason = 'TP3_MAX';
-            trade.netRealizedR = 0.5 * 2.0 + 0.25 * 3.0 + 0.25 * 4.0; // 2.75R
+            trade.netRealizedR = Number((0.5 * tp1R + 0.25 * tp2R + 0.25 * tp3R).toFixed(2));
             trade.exitPrice = formatSsrPrice(trade.tp3);
             trade.exitTime = currBar.time;
             trade.exitTimeString = formatSsrTime(currBar.time);
@@ -1014,7 +1058,7 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
         const rawR = trade.direction === 'LONG'
           ? (currBar.close - trade.entryPrice) / (trade.riskAmount || 1)
           : (trade.entryPrice - currBar.close) / (trade.riskAmount || 1);
-        trade.netRealizedR = Number(Math.max(-1.0, Math.min(2.75, rawR)).toFixed(2));
+        trade.netRealizedR = Number(Math.max(-1.0, Math.min(tp3R, rawR)).toFixed(2));
         if (trade.netRealizedR <= 0) {
           failureClassification.CHOPPY_TIME_EXPIRATION++;
           trade.failureCategory = 'CHOPPY_TIME_EXPIRATION';
@@ -1095,7 +1139,7 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
           activeTrade = {
             trade: newTrade,
             entryBarIdx: i,
-            breakEvenActivated: false,
+            stage: 0,
           };
           pendingOrder = null;
           continue;
@@ -1114,34 +1158,50 @@ export function runSsrBacktest(options: SsrBacktestOptions): SsrBacktestSummary 
     const sweep = checkLiquiditySweep(candlesLTF.slice(startSlice, i + 1), pools, currBar.time);
     if (!sweep) continue;
 
+    // HTF Trend Alignment Guard:
+    // In Bearish trend, do not take Longs against waterfall. In Bullish trend, do not take Shorts against expansion.
+    if (htfTrendFilter) {
+      const trend = getHtfTrendAt(currBar.time);
+      if (trend === 'BEARISH' && sweep.direction === 'LONG') continue;
+      if (trend === 'BULLISH' && sweep.direction === 'SHORT') continue;
+    }
+
     const { sweptPool, direction, sweepExtreme, sweepBarIdx } = sweep;
     const absSweepBarIdx = startSlice + sweepBarIdx;
 
     // Phase 2 MSS
     const mss = detectMarketStructureShift(candlesLTF, absSweepBarIdx, direction, 12);
-    if (!mss) continue;
+    if (!mss || mss.displacementRatio < minDisplacement) continue;
 
     // Phase 3 FVG
     const fvg = detectFairValueGap(candlesLTF, absSweepBarIdx, mss.displacementBarIdx, direction);
-    if (!fvg) continue;
+    if (!fvg || fvg.gapSizePercent < 0.05) continue;
 
-    const entryPrice = fvg.proximalEdge;
-    const spreadBuffer = Math.max(Math.abs(currBar.high - currBar.low) * 0.15, entryPrice * 0.0006);
-    const stopLoss = direction === 'SHORT' ? sweepExtreme + spreadBuffer : sweepExtreme - spreadBuffer;
+    // Consequent Encroachment entry (depth into FVG)
+    const entryPrice = formatSsrPrice(
+      direction === 'LONG'
+        ? fvg.proximalEdge - (fvg.proximalEdge - fvg.distalEdge) * fvgEntryDepth
+        : fvg.proximalEdge + (fvg.distalEdge - fvg.proximalEdge) * fvgEntryDepth
+    );
+
+    // Stop Loss with 0.30% structural buffer to cushion against secondary sweep wicks
+    const spreadBuffer = Math.max(Math.abs(currBar.high - currBar.low) * 0.8, entryPrice * slBufferPct);
+    const stopLoss = formatSsrPrice(direction === 'SHORT' ? sweepExtreme + spreadBuffer : sweepExtreme - spreadBuffer);
     const riskAmount = Math.abs(entryPrice - stopLoss);
     if (riskAmount <= 0) continue;
     const riskPercent = Number(((riskAmount / entryPrice) * 100).toFixed(2));
-    if (riskPercent > 3.8 || riskPercent < 0.1) continue;
+    if (riskPercent > 4.2 || riskPercent < 0.1) continue;
 
-    const tp1 = formatSsrPrice(direction === 'LONG' ? entryPrice + 2.0 * riskAmount : entryPrice - 2.0 * riskAmount);
-    const tp2 = formatSsrPrice(direction === 'LONG' ? entryPrice + 3.0 * riskAmount : entryPrice - 3.0 * riskAmount);
-    const tp3 = formatSsrPrice(direction === 'LONG' ? entryPrice + 4.0 * riskAmount : entryPrice - 4.0 * riskAmount);
+    // High-Expectancy Tiered Exits: TP1 (1.3R), TP2 (2.2R), TP3 (3.5R)
+    const tp1 = formatSsrPrice(direction === 'LONG' ? entryPrice + tp1R * riskAmount : entryPrice - tp1R * riskAmount);
+    const tp2 = formatSsrPrice(direction === 'LONG' ? entryPrice + tp2R * riskAmount : entryPrice - tp2R * riskAmount);
+    const tp3 = formatSsrPrice(direction === 'LONG' ? entryPrice + tp3R * riskAmount : entryPrice - tp3R * riskAmount);
 
     // Arm the Limit Order for Phase 3 "Return"
     pendingOrder = {
       direction,
-      entryPrice: formatSsrPrice(entryPrice),
-      stopLoss: formatSsrPrice(stopLoss),
+      entryPrice,
+      stopLoss,
       tp1,
       tp2,
       tp3,

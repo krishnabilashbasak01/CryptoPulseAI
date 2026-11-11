@@ -111,6 +111,12 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
   const [backtestResult, setBacktestResult] = useState<SsrBacktestSummary | null>(null);
   const [selectedTrade, setSelectedTrade] = useState<SsrBacktestTrade | null>(null);
 
+  // Institutional SMC Strategy Optimization Parameters
+  const [htfTrendFilter, setHtfTrendFilter] = useState<boolean>(true);
+  const [fvgEntryDepth, setFvgEntryDepth] = useState<number>(0.30); // 30% Consequent Encroachment
+  const [slBufferPct, setSlBufferPct] = useState<number>(0.0030);   // 0.30% structural buffer
+  const [tpPreset, setTpPreset] = useState<'INSTITUTIONAL' | 'CLASSIC'>('INSTITUTIONAL');
+
   // Stored Backtests Repository
   const [savedBacktests, setSavedBacktests] = useState<SsrBacktestSummary[]>(() => {
     try {
@@ -476,6 +482,10 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 28000);
 
+        const tpConfig = tpPreset === 'INSTITUTIONAL'
+          ? { tp1R: 1.3, tp2R: 2.2, tp3R: 3.5 }
+          : { tp1R: 2.0, tp2R: 3.0, tp3R: 4.0 };
+
         const res = await fetch('/api/ssr/backtest', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -489,7 +499,11 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
             customEnd,
             riskPerTrade: riskAmountUsdt,
             accountEquity,
-            maxHoldBars: 72,
+            maxHoldBars: 96,
+            htfTrendFilter,
+            fvgEntryDepth,
+            slBufferPct,
+            ...tpConfig,
           }),
         });
         clearTimeout(timeoutId);
@@ -519,6 +533,10 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
           endTimeMs = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
         }
 
+        const tpConfig = tpPreset === 'INSTITUTIONAL'
+          ? { tp1R: 1.3, tp2R: 2.2, tp3R: 3.5 }
+          : { tp1R: 2.0, tp2R: 3.0, tp3R: 4.0 };
+
         summary = runSsrBacktest({
           symbol: selectedSymbol,
           timeframeLTF,
@@ -530,7 +548,11 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
           dateRangePreset,
           riskPerTradeUsdt: riskAmountUsdt,
           accountEquityUsdt: accountEquity,
-          maxHoldBars: 72,
+          maxHoldBars: 96,
+          htfTrendFilter,
+          fvgEntryDepth,
+          slBufferPct,
+          ...tpConfig,
         });
       }
 
@@ -1497,6 +1519,84 @@ export const SsrStrategyPanel: React.FC<SsrStrategyPanelProps> = ({
                 <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-sky-400 font-bold text-[11px]">
                   Trigger: {timeframeLTF.toUpperCase()}
                 </span>
+              </div>
+            </div>
+
+            {/* Institutional Parameter Optimization Settings */}
+            <div className="p-3.5 bg-slate-950/60 border border-slate-800/80 rounded-lg flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+              <div className="flex flex-wrap items-center gap-4">
+                {/* 1. HTF Trend Guard */}
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400">Trend Bias:</span>
+                  <button
+                    type="button"
+                    onClick={() => setHtfTrendFilter((prev) => !prev)}
+                    className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                      htfTrendFilter
+                        ? 'bg-emerald-600/30 border border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-900 border border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {htfTrendFilter ? '✓ 1H Trend-Aligned' : 'Counter-Trend Allowed'}
+                  </button>
+                </div>
+
+                {/* 2. FVG Entry Depth (Consequent Encroachment) */}
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400">Entry Fill:</span>
+                  <button
+                    type="button"
+                    onClick={() => setFvgEntryDepth((prev) => (prev === 0 ? 0.30 : 0))}
+                    className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                      fvgEntryDepth > 0
+                        ? 'bg-sky-600/30 border border-sky-500/40 text-sky-300'
+                        : 'bg-slate-900 border border-slate-800 text-slate-400'
+                    }`}
+                  >
+                    {fvgEntryDepth > 0 ? 'Consequent Encroachment (30% CE)' : 'Proximal Edge (0%)'}
+                  </button>
+                </div>
+
+                {/* 3. Stop-Loss Secondary Sweep Buffer */}
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400">SL Buffer:</span>
+                  <button
+                    type="button"
+                    onClick={() => setSlBufferPct((prev) => (prev === 0.0030 ? 0.0010 : 0.0030))}
+                    className="px-2 py-1 rounded text-[11px] font-bold bg-slate-900 border border-slate-800 text-indigo-300"
+                  >
+                    {slBufferPct === 0.0030 ? '0.30% Volatility Cushion' : '0.10% Tight Wick'}
+                  </button>
+                </div>
+
+                {/* 4. Target Preset */}
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-400">Tiered Exits:</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setTpPreset('INSTITUTIONAL')}
+                      className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                        tpPreset === 'INSTITUTIONAL'
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-slate-900 border border-slate-800 text-slate-400'
+                      }`}
+                    >
+                      1:1.3R (50%+BE), 2.2R, 3.5R
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTpPreset('CLASSIC')}
+                      className={`px-2 py-1 rounded text-[11px] font-bold transition-colors ${
+                        tpPreset === 'CLASSIC'
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-slate-900 border border-slate-800 text-slate-400'
+                      }`}
+                    >
+                      Classic 1:2, 1:3, 1:4
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 

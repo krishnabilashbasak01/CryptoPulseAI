@@ -970,7 +970,14 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
         customEnd,
         riskPerTrade = 100,
         accountEquity = 10000,
-        maxHoldBars = 72,
+        maxHoldBars = 96,
+        htfTrendFilter = true,
+        fvgEntryDepth = 0.30,
+        slBufferPct = 0.0030,
+        tp1R = 1.3,
+        tp2R = 2.2,
+        tp3R = 3.5,
+        minDisplacement = 1.18,
       } = req.body ?? {};
 
       const now = Date.now();
@@ -1075,7 +1082,14 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
         dateRangePreset,
         riskPerTradeUsdt: Number(riskPerTrade) || 100,
         accountEquityUsdt: Number(accountEquity) || 10000,
-        maxHoldBars: Number(maxHoldBars) || 72,
+        maxHoldBars: Number(maxHoldBars) || 96,
+        htfTrendFilter: htfTrendFilter !== false,
+        fvgEntryDepth: typeof fvgEntryDepth === 'number' ? fvgEntryDepth : 0.30,
+        slBufferPct: typeof slBufferPct === 'number' ? slBufferPct : 0.0030,
+        tp1R: typeof tp1R === 'number' ? tp1R : 1.3,
+        tp2R: typeof tp2R === 'number' ? tp2R : 2.2,
+        tp3R: typeof tp3R === 'number' ? tp3R : 3.5,
+        minDisplacement: typeof minDisplacement === 'number' ? minDisplacement : 1.18,
       });
 
       res.json({ success: true, backtest: summary });
