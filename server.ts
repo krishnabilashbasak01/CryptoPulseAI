@@ -21,6 +21,13 @@ import {
   type FourHourFractalLevels,
   type BacktestSummary,
 } from './src/utils/fractal.ts';
+import {
+  runSsrBacktest,
+  findLiveSsrSignal,
+  calculateSsrPositionSize,
+  type SsrBacktestSummary,
+  type SsrSignal,
+} from './src/utils/ssrStrategy.ts';
 
 dotenv.config();
 
@@ -946,6 +953,181 @@ Return ONLY a valid JSON object (no markdown fences, no extra prose) with these 
       res.json({ success: true, backtest: backtestReport });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || 'Backtest execution failed' });
+    }
+  });
+
+  // 7. Sweep, Shift, and Return (SSR) Strategy Backtest Runner
+  app.post('/api/ssr/backtest', async (req, res) => {
+    try {
+      const {
+        symbol = 'BTCUSDT',
+        timeframeLTF = '5m',
+        timeframeHTF = '1h',
+        dateRangePreset = '7d',
+        customStart,
+        customEnd,
+        riskPerTrade = 100,
+        accountEquity = 10000,
+        maxHoldBars = 72,
+      } = req.body ?? {};
+
+      const now = Date.now();
+      let startTimeMs = now - 7 * 24 * 3600 * 1000;
+      let endTimeMs = now;
+
+      if (dateRangePreset === '24h') {
+        startTimeMs = now - 24 * 3600 * 1000;
+      } else if (dateRangePreset === '3d') {
+        startTimeMs = now - 3 * 24 * 3600 * 1000;
+      } else if (dateRangePreset === '7d') {
+        startTimeMs = now - 7 * 24 * 3600 * 1000;
+      } else if (dateRangePreset === '14d') {
+        startTimeMs = now - 14 * 24 * 3600 * 1000;
+      } else if (dateRangePreset === '30d') {
+        startTimeMs = now - 30 * 24 * 3600 * 1000;
+      } else if (dateRangePreset === 'custom' && customStart && customEnd) {
+        const rawStart = new Date(customStart).getTime();
+        const rawEnd = new Date(customEnd).getTime() + (24 * 3600 * 1000 - 1);
+        startTimeMs = Math.min(rawStart, rawEnd);
+        endTimeMs = Math.max(rawStart, rawEnd);
+      }
+
+      const spanMs = Math.max(0, endTimeMs - startTimeMs);
+      const barMs = timeframeLTF === '1m' ? 60 * 1000 : timeframeLTF === '3m' ? 3 * 60 * 1000 : 5 * 60 * 1000;
+      const neededBars = Math.ceil(spanMs / barMs) + 60;
+      const MAX_LTF_BARS = 12000;
+      const targetBars = Math.min(neededBars, MAX_LTF_BARS);
+
+      // 1. Fetch HTF candles (1h or 4h) with 20-day warmup for Liquidity Pools
+      const htfStartMs = Math.max(0, startTimeMs - 20 * 24 * 3600 * 1000);
+      let candlesHTF: Candle[] = [];
+      try {
+        let curHTF = htfStartMs;
+        while (curHTF < endTimeMs && candlesHTF.length < 2500) {
+          const batchLimit = Math.min(1000, 2500 - candlesHTF.length);
+          const rawHTF = await fetchFromBinance(
+            `/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframeHTF)}&limit=${batchLimit}&startTime=${curHTF}`
+          );
+          if (!Array.isArray(rawHTF) || rawHTF.length === 0) break;
+          const mapped = rawHTF.map((k: any) => ({
+            time: Number(k[0]),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+            quoteVolume: parseFloat(k[7]),
+          }));
+          candlesHTF = candlesHTF.concat(mapped);
+          const lastTime = mapped[mapped.length - 1].time;
+          if (lastTime >= endTimeMs || rawHTF.length < batchLimit) break;
+          curHTF = lastTime + 1;
+        }
+        if (candlesHTF.length === 0) {
+          candlesHTF = buildFallbackKlines(symbol, timeframeHTF, 500);
+        }
+      } catch {
+        candlesHTF = buildFallbackKlines(symbol, timeframeHTF, 500);
+      }
+
+      // 2. Fetch LTF execution candles (5m, 3m, 1m) starting from startTimeMs forward
+      let candlesLTF: Candle[] = [];
+      try {
+        const ltfStartMs = Math.max(0, startTimeMs - 20 * barMs);
+        let curLTF = ltfStartMs;
+        while (candlesLTF.length < targetBars && curLTF <= endTimeMs) {
+          const batchLimit = Math.min(1000, targetBars - candlesLTF.length);
+          const rawBatch = await fetchFromBinance(
+            `/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframeLTF)}&limit=${batchLimit}&startTime=${curLTF}`
+          );
+          if (!Array.isArray(rawBatch) || rawBatch.length === 0) break;
+          const mappedBatch = rawBatch.map((k: any) => ({
+            time: Number(k[0]),
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+            quoteVolume: parseFloat(k[7]),
+          }));
+          candlesLTF = candlesLTF.concat(mappedBatch);
+          const lastTime = mappedBatch[mappedBatch.length - 1].time;
+          if (lastTime >= endTimeMs || rawBatch.length < batchLimit) break;
+          curLTF = lastTime + 1;
+        }
+        if (candlesLTF.length === 0) {
+          throw new Error('Empty LTF klines');
+        }
+      } catch {
+        candlesLTF = buildFallbackKlines(symbol, timeframeLTF, 1000);
+      }
+
+      const summary = runSsrBacktest({
+        symbol,
+        timeframeLTF: timeframeLTF as '5m' | '3m' | '1m',
+        timeframeHTF: timeframeHTF as '1h' | '4h',
+        candlesHTF,
+        candlesLTF,
+        startTimeMs,
+        endTimeMs,
+        dateRangePreset,
+        riskPerTradeUsdt: Number(riskPerTrade) || 100,
+        accountEquityUsdt: Number(accountEquity) || 10000,
+        maxHoldBars: Number(maxHoldBars) || 72,
+      });
+
+      res.json({ success: true, backtest: summary });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'SSR backtest failed' });
+    }
+  });
+
+  // 8. Sweep, Shift, and Return (SSR) Multi-Asset Live Scanner
+  app.get('/api/ssr/scan', async (_req, res) => {
+    try {
+      const symbolsToScan = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'XRPUSDT', 'NEARUSDT', 'AVAXUSDT', 'SUIUSDT'];
+      const results: any[] = [];
+
+      await Promise.all(
+        symbolsToScan.map(async (sym) => {
+          try {
+            const [rawHTF, rawLTF] = await Promise.all([
+              fetchFromBinance(`/klines?symbol=${sym}&interval=1h&limit=80`),
+              fetchFromBinance(`/klines?symbol=${sym}&interval=5m&limit=80`),
+            ]);
+
+            const mapK = (k: any) => ({
+              time: Number(k[0]),
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[5]),
+              quoteVolume: parseFloat(k[7] || k[5] || '0'),
+            });
+
+            const candlesHTF = Array.isArray(rawHTF) ? rawHTF.map(mapK) : [];
+            const candlesLTF = Array.isArray(rawLTF) ? rawLTF.map(mapK) : [];
+
+            const signal = findLiveSsrSignal(candlesHTF, candlesLTF, sym, 100);
+            if (signal) {
+              results.push(signal);
+            }
+          } catch {
+            // ignore individual coin scan errors
+          }
+        })
+      );
+
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        scannedCount: symbolsToScan.length,
+        signalCount: results.length,
+        signals: results,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'SSR live scan failed' });
     }
   });
 

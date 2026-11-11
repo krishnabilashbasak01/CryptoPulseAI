@@ -41,6 +41,7 @@ import { OrderBookPanel } from './components/OrderBookPanel';
 import { AiSignalPanel } from './components/AiSignalPanel';
 import { AlertsManager } from './components/AlertsManager';
 import { FractalScannerPanel } from './components/FractalScannerPanel';
+import { SsrStrategyPanel } from './components/SsrStrategyPanel';
 import { UnifiedSignalsPanel } from './components/UnifiedSignalsPanel';
 import {
   SEED_UNIFIED_SIGNALS,
@@ -115,7 +116,7 @@ export default function App() {
   const [aiConfirmModalOpen, setAiConfirmModalOpen] = useState<boolean>(false);
 
   // Terminal Navigation View State: Dedicated Workspaces
-  type TerminalTab = 'TERMINAL' | 'FRACTAL' | 'AI_QUANT' | 'SIGNALS' | 'ALERTS';
+  type TerminalTab = 'TERMINAL' | 'FRACTAL' | 'SSR' | 'AI_QUANT' | 'SIGNALS' | 'ALERTS';
   const [terminalTab, setTerminalTab] = useState<TerminalTab>('TERMINAL');
 
   // Unified Signals Ledger Hub State (Rule 6 + User Request: Separate all signals with strategy & AI decision)
@@ -592,6 +593,19 @@ export default function App() {
 
           <button
             type="button"
+            onClick={() => setTerminalTab('SSR')}
+            className={`px-3.5 py-1.5 rounded-md transition-colors flex items-center gap-1.5 ${
+              terminalTab === 'SSR'
+                ? 'bg-indigo-600 text-white font-semibold shadow-sm'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <Compass className="w-3.5 h-3.5 text-indigo-400" />
+            <span>SSR Institutional Strategy</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setTerminalTab('AI_QUANT')}
             className={`px-3.5 py-1.5 rounded-md transition-colors flex items-center gap-1.5 ${
               terminalTab === 'AI_QUANT'
@@ -890,6 +904,25 @@ export default function App() {
                   onNavigateToSignalsHub={() => setTerminalTab('SIGNALS')}
                   sharedSignalLedger={fractalSignalsForPanel}
                   isActive={terminalTab === 'FRACTAL'}
+                />
+              </ErrorBoundary>
+            </section>
+          </div>
+        )}
+
+        {/* Workspace View: Sweep, Shift, and Return (SSR) Institutional Terminal */}
+        {terminalTab === 'SSR' && (
+          <div className="space-y-5">
+            <section id="ssr-strategy-section">
+              <ErrorBoundary fallbackTitle="Sweep, Shift & Return Strategy Terminal">
+                <SsrStrategyPanel
+                  selectedSymbol={selectedTicker.symbol}
+                  tickers={tickers}
+                  candlesHTF={candles4H}
+                  candlesLTF={candlesLTF}
+                  onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+                  onAddAlert={handleAddAlert}
+                  isActive={terminalTab === 'SSR'}
                 />
               </ErrorBoundary>
             </section>
